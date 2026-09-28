@@ -78,19 +78,19 @@ def get_signal(df):
     return sig, price, vol5, ratio
 
 
-# ---------------- Fetch Data ----------------
+# ---------------- Fetch Data & Resample ----------------
 def fetch_one(row):
     key, name = row["instrument_key"], row["trading_symbol"]
     try:
-        # Rate limit bachane ke liye safe delay (4 workers * 0.45s = no errors)
+        # Rate limit bachane ke liye delay
         time.sleep(0.45) 
         
-        # Pichle 15 din ka data nikalenge taaki 80+ candles (15 min wali) mil sakein
+        # 15 din ka date range taaki kaafi data mil sake
         to_date = datetime.now().strftime("%Y-%m-%d")
         from_date = (datetime.now() - timedelta(days=15)).strftime("%Y-%m-%d")
         
-        # Sahi Historical API URL
-        url = f"https://api.upstox.com/v2/historical-candle/{quote(key, safe='')}/15minute/{to_date}/{from_date}"
+        # API se 1minute data mangwa rahe hain (Kyunki Upstox directly 15min nahi deta)
+        url = f"https://api.upstox.com/v2/historical-candle/{quote(key, safe='')}/1minute/{to_date}/{from_date}"
         
         r = requests.get(url, headers=HEADERS, timeout=10)
         
@@ -104,10 +104,24 @@ def fetch_one(row):
         if not candles:
             return None
             
-        # Upstox newest-first deta hai -> ulta karke purani se nayi arrange kiya
+        # DataFrame banana aur arrange karna
         df = pd.DataFrame(
             candles, columns=["t", "o", "h", "l", "c", "v", "oi"]
         ).iloc[::-1].reset_index(drop=True)
+        
+        # --- RESAMPLING LOGIC: 1 Min ko 15 Min mein convert karna ---
+        df["t"] = pd.to_datetime(df["t"])
+        df.set_index("t", inplace=True)
+        
+        # Data ko 15 minute ki candles mein combine karna
+        df = df.resample("15min").agg({
+            "o": "first",
+            "h": "max",
+            "l": "min",
+            "c": "last",
+            "v": "sum"
+        }).dropna().reset_index()
+        # -------------------------------------------------------------
         
         sig, price, vol5, ratio = get_signal(df)
         if not sig:
