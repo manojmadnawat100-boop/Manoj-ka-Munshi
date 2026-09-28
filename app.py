@@ -1,4 +1,4 @@
-import time
+import time  # FIXED: Capital 'I' se small 'i' kar diya
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from urllib.parse import quote
@@ -82,11 +82,13 @@ def get_signal(df):
 def fetch_one(row):
     key, name = row["instrument_key"], row["trading_symbol"]
     try:
-        time.sleep(0.1) # Rate limit bachane ke liye chhota sa delay
+        # FIXED: Rate limit (10 req/sec) bachane ke liye delay badhaya 
+        # (4 workers * 0.45s delay = safe execution)
+        time.sleep(0.45) 
         
         # Yahan '15minute' lagaya gaya hai
         r = requests.get(
-            f"{BASE}/{quote(key, safe='')}/15minute", headers=HEADERS, timeout=8
+            f"{BASE}/{quote(key, safe='')}/15minute", headers=HEADERS, timeout=10
         )
         if r.status_code == 401:
             return {"error": "TOKEN"}
@@ -240,3 +242,4 @@ if pos:
         st.rerun()
 else:
     st.info("Folder khaali hai")
+    
