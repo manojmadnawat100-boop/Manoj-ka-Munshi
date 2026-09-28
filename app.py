@@ -1,6 +1,6 @@
-import time  # FIXED: Capital 'I' se small 'i' kar diya
+import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date
+from datetime import date, datetime, timedelta
 from urllib.parse import quote
 
 import pandas as pd
@@ -14,7 +14,6 @@ st.title("🏪 Manoj Ji ki Dukaan - Nifty 500 (15 Min EMA Crossover)")
 # ---------------- Secrets & Headers ----------------
 TOKEN = st.secrets.get("UPSTOX_TOKEN", "")
 HEADERS = {"Authorization": f"Bearer {TOKEN}", "Accept": "application/json"}
-BASE = "https://api.upstox.com/v2/historical-candle/intraday"
 
 # ---------------- Sidebar settings ----------------
 st.sidebar.header("⚙️ Settings")
@@ -79,27 +78,33 @@ def get_signal(df):
     return sig, price, vol5, ratio
 
 
+# ---------------- Fetch Data ----------------
 def fetch_one(row):
     key, name = row["instrument_key"], row["trading_symbol"]
     try:
-        # FIXED: Rate limit (10 req/sec) bachane ke liye delay badhaya 
-        # (4 workers * 0.45s delay = safe execution)
+        # Rate limit bachane ke liye safe delay (4 workers * 0.45s = no errors)
         time.sleep(0.45) 
         
-        # Yahan '15minute' lagaya gaya hai
-        r = requests.get(
-            f"{BASE}/{quote(key, safe='')}/15minute", headers=HEADERS, timeout=10
-        )
+        # Pichle 15 din ka data nikalenge taaki 80+ candles (15 min wali) mil sakein
+        to_date = datetime.now().strftime("%Y-%m-%d")
+        from_date = (datetime.now() - timedelta(days=15)).strftime("%Y-%m-%d")
+        
+        # Sahi Historical API URL
+        url = f"https://api.upstox.com/v2/historical-candle/{quote(key, safe='')}/15minute/{to_date}/{from_date}"
+        
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        
         if r.status_code == 401:
             return {"error": "TOKEN"}
         if r.status_code == 429:
             return {"error": "RATE"}
         r.raise_for_status()
+        
         candles = r.json()["data"]["candles"]
         if not candles:
             return None
             
-        # Upstox newest-first deta hai -> ulta karke purani se nayi
+        # Upstox newest-first deta hai -> ulta karke purani se nayi arrange kiya
         df = pd.DataFrame(
             candles, columns=["t", "o", "h", "l", "c", "v", "oi"]
         ).iloc[::-1].reset_index(drop=True)
@@ -120,19 +125,20 @@ def fetch_one(row):
         return {"error": f"{name}: {e}"}
 
 
+# ---------------- Scanner Logic ----------------
 def run_scan(stocks):
     results, errors = [], []
     bar = st.progress(0, text="Scan chal raha hai...")
     total = len(stocks)
     rows = [r for _, r in stocks.iterrows()]
     
-    # 4 workers taaki API block na ho
+    # 4 workers parallel processing ke liye
     with ThreadPoolExecutor(max_workers=4) as ex:
         for i, out in enumerate(ex.map(fetch_one, rows), 1):
             if out:
                 (errors if "error" in out else results).append(out)
             if i % 10 == 0 or i == total:
-                bar.progress(i / total, text=f"{i}/{total} shares")
+                bar.progress(i / total, text=f"{i}/{total} shares scan ho gaye")
     
     bar.empty()
     st.session_state["signals"] = results
@@ -152,7 +158,6 @@ if not is_real:
 
 
 # ---------------- Auto-Refresh Fragment ----------------
-# UI block kiye bina timer chalane ke liye Streamlit fragment
 @st.fragment(run_every=interval * 60 if auto else None)
 def auto_scanner_section():
     manual_scan = st.button("🔍 Abhi Scan Karo (15 Min)")
@@ -161,10 +166,9 @@ def auto_scanner_section():
     time_since_last = time.time() - last
     due = auto and (time_since_last >= interval * 60)
     
-    # Agar button click hua ya auto-timer trigger hua
     if manual_scan or due:
         run_scan(stocks)
-        st.rerun() # Refresh karke nayi list dikhane ke liye
+        st.rerun()
 
     if "last_scan" in st.session_state:
         st.caption(
@@ -174,7 +178,6 @@ def auto_scanner_section():
     else:
         st.info("Market time mein 'Abhi Scan Karo' dabao.")
 
-# Fragment ko call karna
 auto_scanner_section()
 
 
@@ -197,10 +200,10 @@ if "positions" not in st.session_state:
 
 def add_pos(s):
     st.session_state["positions"][s["Share"]] = s
-    st.toast("Rakh liya!")
+    st.toast(f"{s['Share']} folder mein daal diya!")
 
 
-# ---------------- Dukaan ----------------
+# ---------------- Dukaan UI ----------------
 st.divider()
 col1, col2 = st.columns(2)
 with col1:
@@ -209,7 +212,6 @@ with col1:
         c1, c2 = st.columns([3, 1])
         c1.write(f"**{s['Share']}** @ ₹{s['Bhav']}")
         
-        # Unique button key taaki galat share add na ho
         if s["Signal"] == "BUY":
             c2.button("🟢 BUY", key=f"b_{s['Share']}_{idx}", on_click=add_pos, args=(s,))
         else:
@@ -221,12 +223,12 @@ with col2:
         hdf = pd.DataFrame(heavy)[["Share", "Signal", "Bhav", "Volume", "Vol x"]]
         st.dataframe(hdf, use_container_width=True)
     else:
-        st.info("Abhi toofan nahi hai")
+        st.info("Abhi market shant hai, koi heavy volume cross nahi hua.")
 
 
-# ---------------- Position folder (paper only) ----------------
+# ---------------- Position folder ----------------
 st.divider()
-st.subheader("📁 Meri Position (sirf record, order nahi jata)")
+st.subheader("📁 Meri Position (Sirf record ke liye)")
 pos = list(st.session_state["positions"].values())
 if pos:
     pdf = pd.DataFrame(pos)[["Share", "Signal", "Bhav"]]
@@ -237,9 +239,9 @@ if pos:
         pdf.to_csv(index=False).encode("utf-8"),
         f"hisab_{date.today()}.csv",
     )
-    if st.button("❌ Sab Bech Do"):
+    if st.button("❌ Sab Hatao"):
         st.session_state["positions"] = {}
         st.rerun()
 else:
-    st.info("Folder khaali hai")
+    st.info("Folder khaali hai.")
     
