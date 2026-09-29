@@ -1,261 +1,213 @@
-import time
+import logging
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime, timedelta
-from urllib.parse import quote
-
+from datetime import datetime
 import pandas as pd
 import requests
 import streamlit as st
 
-# ---------------- Page Config ----------------
-st.set_page_config(page_title="Manoj Ji ki Dukaan", layout="wide")
-st.title("🏪 Manoj Ji ki Dukaan - Nifty 500 (15 Min EMA Crossover)")
+logging.basicConfig(level=logging.INFO)
 
-# ---------------- Secrets & Headers ----------------
+st.set_page_config(page_title="Institutional EMA Scanner - Full NSE", layout="wide")
+st.title("⚡ Institutional EMA 36/72 Crossover + Volume Engine (All NSE)")
+
 TOKEN = st.secrets.get("UPSTOX_TOKEN", "")
-HEADERS = {"Authorization": f"Bearer {TOKEN}", "Accept": "application/json"}
+TG_TOKEN = st.secrets.get("TELEGRAM_TOKEN", "")
+TG_CHAT = st.secrets.get("TELEGRAM_CHAT_ID", "")
 
-# ---------------- Sidebar settings ----------------
-st.sidebar.header("⚙️ Settings")
-vol_mult = st.sidebar.number_input("Heavy volume (x avg)", 1.0, 10.0, 2.5, 0.5)
-max_stocks = st.sidebar.slider("Kitne shares scan karein", 50, 500, 500, 50)
-auto = st.sidebar.checkbox("Auto refresh", value=False)
-interval = st.sidebar.slider("Refresh gap (minute)", 2, 15, 5)
+HEADERS = {
+    "Authorization": f"Bearer {TOKEN.strip()}",
+    "Accept": "application/json"
+}
 
+def send_tg(msg: str):
+    if not TG_TOKEN or not TG_CHAT:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+        requests.post(url, json={"chat_id": TG_CHAT, "text": msg, "parse_mode": "Markdown"}, timeout=5)
+    except Exception as e:
+        logging.error(f"Telegram alert failed: {e}")
 
-# ---------------- Stock list ----------------
 @st.cache_data(ttl=86400)
-def load_stocks():
-    inst = pd.read_json(
-        "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
-    )
-    inst = inst[(inst["segment"] == "NSE_EQ") & (inst["instrument_type"] == "EQ")]
-    inst = inst[["instrument_key", "trading_symbol"]]
+def get_all_nse_keys():
     try:
-        n500 = pd.read_csv(
-            "https://niftyindices.com/IndexConstituent/ind_nifty500list.csv",
-            storage_options={"User-Agent": "Mozilla/5.0"},
-        )
-        df = inst.merge(n500[["Symbol"]], left_on="trading_symbol", right_on="Symbol")
-        return df[["instrument_key", "trading_symbol"]].reset_index(drop=True), True
-    except Exception:
-        return inst.head(500).reset_index(drop=True), False
+        url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+        inst = pd.read_json(url)
+        tc = "trading_symbol" if "trading_symbol" in inst.columns else "tradingsymbol"
+        # Sirf standard active NSE equity shares filter karo
+        inst = inst[inst["instrument_key"].str.contains("NSE_EQ", na=False)]
+        inst = inst[inst["instrument_type"] == "EQ"]
+        inst = inst.dropna(subset=[tc, "instrument_key"])
+        return dict(zip(inst[tc], inst["instrument_key"]))
+    except Exception as e:
+        st.error(f"NSE instruments file download fail hui: {e}")
+        return {}
 
+def fetch_candles(ikey: str, tf: str):
+    url = f"https://api.upstox.com/v2/historical-candle/intraday/{ikey}/1minute"
 
-# ---------------- Signal logic ----------------
-def get_signal(df):
-    # EMA 72 ke liye kam se kam 80 candles hona zaroori hai
-    if len(df) < 80:
-        return None, None, None, None
-        
-    last5 = df.tail(5)
-    prev = df.iloc[:-5].tail(30)
-    
-    # Volume logic
-    avg_vol = prev["v"].mean()
-    vol5 = float(last5["v"].sum())
-    ratio = (last5["v"].mean() / avg_vol) if avg_vol > 0 else 0
-    price = float(df["c"].iloc[-1])
-
-    # EMA 36 (Green) aur EMA 72 (Red) calculation
-    df['EMA_36'] = df['c'].ewm(span=36, adjust=False).mean()
-    df['EMA_72'] = df['c'].ewm(span=72, adjust=False).mean()
-
-    # Crossover check (Last 2 candles)
-    prev_ema36 = df['EMA_36'].iloc[-2]
-    prev_ema72 = df['EMA_72'].iloc[-2]
-    curr_ema36 = df['EMA_36'].iloc[-1]
-    curr_ema72 = df['EMA_72'].iloc[-1]
-
-    sig = None
-    # BUY: Green (36) line Red (72) line ko neeche se upar cut kare
-    if (prev_ema36 <= prev_ema72) and (curr_ema36 > curr_ema72):
-        sig = "BUY"
-    # SELL: Green (36) line Red (72) line ko upar se neeche cut kare
-    elif (prev_ema36 >= prev_ema72) and (curr_ema36 < curr_ema72):
-        sig = "SELL"
-
-    return sig, price, vol5, ratio
-
-
-# ---------------- Fetch Data & Resample ----------------
-def fetch_one(row):
-    key, name = row["instrument_key"], row["trading_symbol"]
     try:
-        # Rate limit bachane ke liye delay
-        time.sleep(0.45) 
-        
-        # 15 din ka date range taaki kaafi data mil sake
-        to_date = datetime.now().strftime("%Y-%m-%d")
-        from_date = (datetime.now() - timedelta(days=15)).strftime("%Y-%m-%d")
-        
-        # API se 1minute data mangwa rahe hain (Kyunki Upstox directly 15min nahi deta)
-        url = f"https://api.upstox.com/v2/historical-candle/{quote(key, safe='')}/1minute/{to_date}/{from_date}"
-        
-        r = requests.get(url, headers=HEADERS, timeout=10)
-        
-        if r.status_code == 401:
-            return {"error": "TOKEN"}
-        if r.status_code == 429:
-            return {"error": "RATE"}
-        r.raise_for_status()
-        
-        candles = r.json()["data"]["candles"]
-        if not candles:
-            return None
-            
-        # DataFrame banana aur arrange karna
-        df = pd.DataFrame(
-            candles, columns=["t", "o", "h", "l", "c", "v", "oi"]
-        ).iloc[::-1].reset_index(drop=True)
-        
-        # --- RESAMPLING LOGIC: 1 Min ko 15 Min mein convert karna ---
-        df["t"] = pd.to_datetime(df["t"])
-        df.set_index("t", inplace=True)
-        
-        # Data ko 15 minute ki candles mein combine karna
-        df = df.resample("15min").agg({
+        res = requests.get(url, headers=HEADERS, timeout=8)
+        data = []
+        if res.status_code == 200:
+            data = res.json().get("data", {}).get("candles", [])
+
+        if not data:
+            to_date = datetime.now().strftime("%Y-%m-%d")
+            url_fallback = f"https://api.upstox.com/v2/historical-candle/{ikey}/30minute/{to_date}"
+            res = requests.get(url_fallback, headers=HEADERS, timeout=8)
+            if res.status_code == 200:
+                data = res.json().get("data", {}).get("candles", [])
+
+        if len(data) < 20:
+            return None, "Insufficient raw candles"
+
+        data = list(reversed(data))
+        df = pd.DataFrame(data, columns=["ts", "o", "h", "l", "c", "v", "oi"])
+        df["ts"] = pd.to_datetime(df["ts"])
+        for col in ["o", "h", "l", "c", "v"]:
+            df[col] = df[col].astype(float)
+
+        # Timeframe Resampling
+        df.set_index("ts", inplace=True)
+        rule = "15min" if tf == "15m" else "5min"
+        resampled_df = df.resample(rule).agg({
             "o": "first",
             "h": "max",
             "l": "min",
             "c": "last",
             "v": "sum"
         }).dropna().reset_index()
-        # -------------------------------------------------------------
-        
-        sig, price, vol5, ratio = get_signal(df)
-        if not sig:
-            return None
-            
-        return {
-            "Share": name,
-            "Signal": sig,
-            "Bhav": round(price, 2),
-            "Volume": int(vol5),
-            "Vol x": round(ratio, 1),
-            "Heavy": ratio >= vol_mult,
-        }
+
+        # 15m me max 25 candles banti hain, isliye limit 15 rakhi hai
+        min_required = 15 if tf == "15m" else 30
+        if len(resampled_df) < min_required:
+            return None, "Insufficient resampled candles"
+
+        return resampled_df, None
     except Exception as e:
-        return {"error": f"{name}: {e}"}
+        return None, str(e)
 
+def analyze_institutional_signal(args):
+    sym, ikey, tf = args
 
-# ---------------- Scanner Logic ----------------
-def run_scan(stocks):
-    results, errors = [], []
-    bar = st.progress(0, text="Scan chal raha hai...")
-    total = len(stocks)
-    rows = [r for _, r in stocks.iterrows()]
-    
-    # 4 workers parallel processing ke liye
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        for i, out in enumerate(ex.map(fetch_one, rows), 1):
-            if out:
-                (errors if "error" in out else results).append(out)
-            if i % 10 == 0 or i == total:
-                bar.progress(i / total, text=f"{i}/{total} shares scan ho gaye")
-    
-    bar.empty()
-    st.session_state["signals"] = results
-    st.session_state["errors"] = errors
-    st.session_state["last_scan"] = time.time()
+    df, err = fetch_candles(ikey, tf)
+    if df is None:
+        return None
 
+    try:
+        df["ema36"] = df["c"].ewm(span=36, adjust=False).mean()
+        df["ema72"] = df["c"].ewm(span=72, adjust=False).mean()
+        df["ema200"] = df["c"].ewm(span=min(len(df), 200), adjust=False).mean()
+        df["vol_sma"] = df["v"].rolling(window=10).mean()
 
-# ---------------- Guard ----------------
-if not TOKEN:
-    st.error("UPSTOX_TOKEN secrets mein nahi mila. Token roz naya banana padta hai.")
-    st.stop()
+        curr = df.iloc[-2]
+        prev = df.iloc[-3]
 
-stocks, is_real = load_stocks()
-stocks = stocks.head(max_stocks)
-if not is_real:
-    st.warning("Nifty 500 list nahi mili, NSE ke pehle shares scan ho rahe hain.")
+        prev_diff = prev["ema36"] - prev["ema72"]
+        curr_diff = curr["ema36"] - curr["ema72"]
 
+        volume_confirmed = curr["v"] > (curr["vol_sma"] * 1.2) if not pd.isna(curr["vol_sma"]) else False
 
-# ---------------- Auto-Refresh Fragment ----------------
-@st.fragment(run_every=interval * 60 if auto else None)
-def auto_scanner_section():
-    manual_scan = st.button("🔍 Abhi Scan Karo (15 Min)")
-    
-    last = st.session_state.get("last_scan", 0)
-    time_since_last = time.time() - last
-    due = auto and (time_since_last >= interval * 60)
-    
-    if manual_scan or due:
-        run_scan(stocks)
-        st.rerun()
+        signal = "NONE"
+        quality = "Neutral"
 
-    if "last_scan" in st.session_state:
-        st.caption(
-            "Aakhri scan: "
-            + time.strftime("%H:%M:%S", time.localtime(st.session_state["last_scan"]))
-        )
-    else:
-        st.info("Market time mein 'Abhi Scan Karo' dabao.")
+        # Bullish Crossover (36 crosses above 72)
+        if prev_diff <= 0 and curr_diff > 0:
+            if curr["c"] > curr["ema200"] and volume_confirmed:
+                signal = "🟢 HIGH-CONVICTION BULLISH"
+                quality = "A+ (Volume + Trend Aligned)"
+            elif curr["c"] > curr["ema200"]:
+                signal = "🟢 BULLISH"
+                quality = "Moderate (Low Volume)"
+            else:
+                signal = "⚠️ COUNTER-TREND BULLISH"
+                quality = "Weak (Below 200 EMA)"
 
-auto_scanner_section()
+        # Bearish Crossover (36 crosses below 72)
+        elif prev_diff >= 0 and curr_diff < 0:
+            if curr["c"] < curr["ema200"] and volume_confirmed:
+                signal = "🔴 HIGH-CONVICTION BEARISH"
+                quality = "A+ (Volume + Trend Aligned)"
+            elif curr["c"] < curr["ema200"]:
+                signal = "🔴 BEARISH"
+                quality = "Moderate (Low Volume)"
+            else:
+                signal = "⚠️ COUNTER-TREND BEARISH"
+                quality = "Weak (Above 200 EMA)"
 
+        return {
+            "Symbol": sym,
+            "Price": round(curr["c"], 2),
+            "EMA 36": round(curr["ema36"], 2),
+            "EMA 72": round(curr["ema72"], 2),
+            "EMA 200": round(curr["ema200"], 2),
+            "Volume Surge": "✅ Yes" if volume_confirmed else "❌ No",
+            "Signal": signal,
+            "Quality": quality,
+            "Candle Time": str(curr["ts"])[:16]
+        }
+    except Exception:
+        return None
 
-# ---------------- Errors & Results Display ----------------
-errs = st.session_state.get("errors", [])
-if any(e["error"] == "TOKEN" for e in errs):
-    st.error("Token expire ho gaya (401). Naya token secrets mein daalo.")
-elif any(e["error"] == "RATE" for e in errs):
-    st.warning("Rate limit lag gayi. Shares kam karo ya refresh gap badhao.")
-elif errs:
-    with st.expander(f"⚠️ {len(errs)} shares mein error"):
-        st.write([e["error"] for e in errs[:20]])
-
-signals = st.session_state.get("signals", [])
-heavy = [s for s in signals if s["Heavy"]]
-
-if "positions" not in st.session_state:
-    st.session_state["positions"] = {}
-
-
-def add_pos(s):
-    st.session_state["positions"][s["Share"]] = s
-    st.toast(f"{s['Share']} folder mein daal diya!")
-
-
-# ---------------- Dukaan UI ----------------
-st.divider()
-col1, col2 = st.columns(2)
+# --- UI Controls ---
+col1, col2, col3 = st.columns([2, 2, 1])
 with col1:
-    st.subheader(f"📊 Saare Signals ({len(signals)})")
-    for idx, s in enumerate(signals):
-        c1, c2 = st.columns([3, 1])
-        c1.write(f"**{s['Share']}** @ ₹{s['Bhav']}")
-        
-        if s["Signal"] == "BUY":
-            c2.button("🟢 BUY", key=f"b_{s['Share']}_{idx}", on_click=add_pos, args=(s,))
-        else:
-            c2.button("🔴 SELL", key=f"s_{s['Share']}_{idx}", on_click=add_pos, args=(s,))
-
+    tf = st.selectbox("Select Timeframe", ["15m", "5m"], index=0)
 with col2:
-    st.subheader(f"🔥 Heavy Volume ({len(heavy)})")
-    if heavy:
-        hdf = pd.DataFrame(heavy)[["Share", "Signal", "Bhav", "Volume", "Vol x"]]
-        st.dataframe(hdf, use_container_width=True)
+    scan_limit = st.slider("Scan Stocks Limit (Batching)", min_value=50, max_value=2000, value=200, step=50, 
+                           help="Zyada stocks scan karne par Upstox rate-limits se bachne ke liye limit set karein")
+with col3:
+    st.write("")
+    st.write("")
+    scan_btn = st.button("🔄 Scan Market", use_container_width=True)
+
+all_nse_keys = get_all_nse_keys()
+
+if scan_btn or "app_started" not in st.session_state:
+    st.session_state["app_started"] = True
+
+    if not TOKEN:
+        st.error("⚠️ Streamlit Secrets mein `UPSTOX_TOKEN` enter karein.")
+    elif not all_nse_keys:
+        st.error("⚠️ NSE instruments list load nahi hui.")
     else:
-        st.info("Abhi market shant hai, koi heavy volume cross nahi hua.")
+        # User defined limit ke mutabiq NSE stocks select karo
+        selected_symbols = list(all_nse_keys.keys())[:scan_limit]
+        st.caption(f"Scanning total **{len(selected_symbols)}** active NSE stocks on **{tf}** timeframe...")
 
+        with st.spinner("Market scan in progress..."):
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                tasks = [(sym, all_nse_keys[sym], tf) for sym in selected_symbols]
+                results = list(executor.map(analyze_institutional_signal, tasks))
 
-# ---------------- Position folder ----------------
-st.divider()
-st.subheader("📁 Meri Position (Sirf record ke liye)")
-pos = list(st.session_state["positions"].values())
-if pos:
-    pdf = pd.DataFrame(pos)[["Share", "Signal", "Bhav"]]
-    st.dataframe(pdf, use_container_width=True)
-    
-    st.download_button(
-        "📒 Hisab Download",
-        pdf.to_csv(index=False).encode("utf-8"),
-        f"hisab_{date.today()}.csv",
-    )
-    if st.button("❌ Sab Hatao"):
-        st.session_state["positions"] = {}
-        st.rerun()
-else:
-    st.info("Folder khaali hai.")
-    
+        valid_results = [r for r in results if r is not None]
+
+        if valid_results:
+            res_df = pd.DataFrame(valid_results)
+            signals_df = res_df[res_df["Signal"] != "NONE"]
+
+            if not signals_df.empty:
+                st.subheader(f"🎯 Active Crossover Signals ({len(signals_df)} found)")
+                st.dataframe(signals_df.sort_values(by="Signal", ascending=False), use_container_width=True, hide_index=True)
+
+                for _, row in signals_df.iterrows():
+                    if "HIGH-CONVICTION" in row["Signal"]:
+                        alert_id = f"tg_{row['Symbol']}_{row['Candle Time']}"
+                        if alert_id not in st.session_state:
+                            msg = (
+                                f"🔥 *INSTITUTIONAL SIGNAL*\n"
+                                f"*{row['Symbol']}* ({tf})\n"
+                                f"Signal: {row['Signal']}\n"
+                                f"Price: ₹{row['Price']} | 200 EMA: ₹{row['EMA 200']}\n"
+                                f"Volume Confirmed: {row['Volume Surge']}"
+                            )
+                            send_tg(msg)
+                            st.session_state[alert_id] = True
+            else:
+                st.info("ℹ️ Is batch mein abhi koi fresh 36/72 crossover trigger nahi hua hai.")
+
+            with st.expander(f"📊 Scanned Stocks Overview ({len(res_df)} stocks)"):
+                st.dataframe(res_df.sort_values("Symbol"), use_container_width=True, hide_index=True)
+        else:
+            st.warning("Koi candle data process nahi ho saka. Market timings ya token check karein.")
