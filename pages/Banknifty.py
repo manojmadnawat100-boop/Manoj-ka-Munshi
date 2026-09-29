@@ -9,7 +9,6 @@ st.title("🏦 Bank Nifty Live Order Book & Trend Scanner")
 
 # ---------------- Secrets & Headers ----------------
 TOKEN = st.secrets.get("UPSTOX_TOKEN", "")
-# Upstox API kabhi-kabhi Api-Version header maangta hai, isliye ise add karna safe hai
 HEADERS = {
     "Authorization": f"Bearer {TOKEN}", 
     "Accept": "application/json",
@@ -27,11 +26,24 @@ BANK_NIFTY_SYMBOLS = [
 @st.cache_data(ttl=86400)
 def get_instrument_keys():
     try:
-        # NSE ke sabhi shares ki list load karna
+        # Pura DataFrame load karein
         inst = pd.read_json("https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz")
-        inst = inst[(inst["segment"] == "NSE_EQ") & (inst["instrument_type"] == "EQ")]
         
-        # Upstox mein column ka naam 'tradingsymbol' hota hai (bina underscore ke)
+        # Upstox API updates ko handle karne ke liye column check aur rename logic
+        if 'trading_symbol' in inst.columns:
+            inst.rename(columns={'trading_symbol': 'tradingsymbol'}, inplace=True)
+        elif 'name' in inst.columns and 'tradingsymbol' not in inst.columns:
+            inst.rename(columns={'name': 'tradingsymbol'}, inplace=True)
+            
+        # Agar error abhi bhi hai, toh exact columns screen par dikhayega
+        if 'tradingsymbol' not in inst.columns:
+            st.error(f"Instrument format badal gaya hai. Available columns yeh hain: {inst.columns.tolist()}")
+            return {}
+
+        # Safely filter conditions apply karein
+        if 'segment' in inst.columns and 'instrument_type' in inst.columns:
+            inst = inst[(inst["segment"] == "NSE_EQ") & (inst["instrument_type"] == "EQ")]
+        
         bn_df = inst[inst["tradingsymbol"].isin(BANK_NIFTY_SYMBOLS)]
         
         return dict(zip(bn_df["tradingsymbol"], bn_df["instrument_key"]))
@@ -61,9 +73,9 @@ def fetch_live_data(instrument_dict):
                 # Live data points
                 ltp = quote.get("last_price", 0)
                 
-                # Previous close 'ohlc' ke andar hota hai Upstox API mein
+                # Previous close 'ohlc' ke andar hota hai
                 ohlc = quote.get("ohlc", {})
-                prev_close = ohlc.get("close", 1) # Divide by zero error se bachne ke liye 1
+                prev_close = ohlc.get("close", 1) 
                 
                 buy_qty = quote.get("total_buy_quantity", 0)
                 sell_qty = quote.get("total_sell_quantity", 0)
@@ -106,10 +118,9 @@ if not TOKEN:
 instrument_keys = get_instrument_keys()
 
 if not instrument_keys:
-    st.error("Instrument keys load nahi ho payi. API ya Network check karein.")
-    st.stop()
+    st.stop() # Error message ab direct function ke andar se dikhega
 
-# Auto Refresh logic - Ensure your Streamlit version is >= 1.37.0
+# Auto Refresh logic 
 @st.fragment(run_every=60)
 def live_dashboard():
     col1, col2 = st.columns([3, 1])
@@ -159,7 +170,6 @@ def live_dashboard():
         
         display_df = df.drop(columns=["Strength"]).copy()
         
-        # DataFrame display with conditional formatting
         st.dataframe(
             display_df.style.apply(
                 lambda x: ['background: #e6ffe6' if v > 0 else ('background: #ffe6e6' if v < 0 else '') for v in x], 
@@ -170,3 +180,4 @@ def live_dashboard():
         )
         
 live_dashboard()
+    
