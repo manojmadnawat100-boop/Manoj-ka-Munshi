@@ -9,7 +9,12 @@ st.title("🏦 Bank Nifty Live Order Book & Trend Scanner")
 
 # ---------------- Secrets & Headers ----------------
 TOKEN = st.secrets.get("UPSTOX_TOKEN", "")
-HEADERS = {"Authorization": f"Bearer {TOKEN}", "Accept": "application/json"}
+# Upstox API kabhi-kabhi Api-Version header maangta hai, isliye ise add karna safe hai
+HEADERS = {
+    "Authorization": f"Bearer {TOKEN}", 
+    "Accept": "application/json",
+    "Api-Version": "2.0" 
+}
 QUOTE_URL = "https://api.upstox.com/v2/market-quote/quotes"
 
 # Bank Nifty ke 12 main shares ki list
@@ -21,16 +26,23 @@ BANK_NIFTY_SYMBOLS = [
 
 @st.cache_data(ttl=86400)
 def get_instrument_keys():
-    # NSE ke sabhi shares ki list load karke Bank Nifty wale filter karna
-    inst = pd.read_json("https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz")
-    inst = inst[(inst["segment"] == "NSE_EQ") & (inst["instrument_type"] == "EQ")]
-    
-    bn_df = inst[inst["trading_symbol"].isin(BANK_NIFTY_SYMBOLS)]
-    # Dictionary bana rahe hain taaki API me bhej sakein: {trading_symbol: instrument_key}
-    return dict(zip(bn_df["trading_symbol"], bn_df["instrument_key"]))
+    try:
+        # NSE ke sabhi shares ki list load karna
+        inst = pd.read_json("https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz")
+        inst = inst[(inst["segment"] == "NSE_EQ") & (inst["instrument_type"] == "EQ")]
+        
+        # Upstox mein column ka naam 'tradingsymbol' hota hai (bina underscore ke)
+        bn_df = inst[inst["tradingsymbol"].isin(BANK_NIFTY_SYMBOLS)]
+        
+        return dict(zip(bn_df["tradingsymbol"], bn_df["instrument_key"]))
+    except Exception as e:
+        st.error(f"Error loading instruments: {e}")
+        return {}
 
 def fetch_live_data(instrument_dict):
-    # Sabhi 12 shares ka data ek hi bar mein mangwane ke liye keys ko comma se jodna
+    if not instrument_dict:
+        return None, "Instrument list khali hai."
+
     keys_str = ",".join(instrument_dict.values())
     
     try:
@@ -46,23 +58,27 @@ def fetch_live_data(instrument_dict):
             if ikey in data:
                 quote = data[ikey]
                 
-                # Live data points nikalna
+                # Live data points
                 ltp = quote.get("last_price", 0)
-                prev_close = quote.get("close_price", 1) # Divide by zero error se bachne ke liye 1
+                
+                # Previous close 'ohlc' ke andar hota hai Upstox API mein
+                ohlc = quote.get("ohlc", {})
+                prev_close = ohlc.get("close", 1) # Divide by zero error se bachne ke liye 1
+                
                 buy_qty = quote.get("total_buy_quantity", 0)
                 sell_qty = quote.get("total_sell_quantity", 0)
                 volume = quote.get("volume", 0)
                 
-                # Price Trend (Positive ya Negative)
+                # Price Trend 
                 price_change = ((ltp - prev_close) / prev_close) * 100
                 
                 # Volume Side & Pending Order Logic
                 if buy_qty > sell_qty:
                     order_trend = "🟢 Buyers Jyada"
-                    strength = 1 # Positive score
+                    strength = 1
                 elif sell_qty > buy_qty:
                     order_trend = "🔴 Sellers Jyada"
-                    strength = -1 # Negative score
+                    strength = -1
                 else:
                     order_trend = "⚪ Neutral"
                     strength = 0
@@ -75,7 +91,7 @@ def fetch_live_data(instrument_dict):
                     "Pending Sell Qty": sell_qty,
                     "Volume": volume,
                     "Order Trend": order_trend,
-                    "Strength": strength # Ye final calculation ke kaam aayega
+                    "Strength": strength
                 })
                 
         return results, None
@@ -84,16 +100,16 @@ def fetch_live_data(instrument_dict):
 
 # ---------------- Dashboard UI & Logic ----------------
 if not TOKEN:
-    st.error("UPSTOX_TOKEN set nahi hai. Secrets file check karein.")
+    st.error("UPSTOX_TOKEN set nahi hai. Streamlit secrets (`.streamlit/secrets.toml`) check karein.")
     st.stop()
 
 instrument_keys = get_instrument_keys()
 
 if not instrument_keys:
-    st.error("Instrument keys load nahi ho payi. Network check karein.")
+    st.error("Instrument keys load nahi ho payi. API ya Network check karein.")
     st.stop()
 
-# Auto Refresh 1 minute
+# Auto Refresh logic - Ensure your Streamlit version is >= 1.37.0
 @st.fragment(run_every=60)
 def live_dashboard():
     col1, col2 = st.columns([3, 1])
@@ -107,7 +123,7 @@ def live_dashboard():
     
     if error:
         if error == "TOKEN EXPIRED":
-            st.error("Token expire ho gaya hai. Naya token dalein.")
+            st.error("Token expire ho gaya hai. Naya UPSTOX_TOKEN generate karke dalein.")
         else:
             st.error(f"API Error: {error}")
         return
@@ -120,7 +136,6 @@ def live_dashboard():
         positive_shares = len(df[df["Strength"] == 1])
         negative_shares = len(df[df["Strength"] == -1])
         
-        # 60% requirement (12 me se kam se kam 8 shares (7.2))
         req_60_percent = total_shares * 0.60
         
         st.markdown("### 🧭 Bank Nifty Final Signal")
@@ -142,12 +157,14 @@ def live_dashboard():
         # ---------------- Shares Data Table ----------------
         st.markdown("### 📊 Sabhi Shares ki Live Condition")
         
-        # Table ko sundar banane ke liye thoda formatting
         display_df = df.drop(columns=["Strength"]).copy()
         
-        # DataFrame display
+        # DataFrame display with conditional formatting
         st.dataframe(
-            display_df.style.apply(lambda x: ['background: #e6ffe6' if v > 0 else ('background: #ffe6e6' if v < 0 else '') for v in x], subset=['% Change']),
+            display_df.style.apply(
+                lambda x: ['background: #e6ffe6' if v > 0 else ('background: #ffe6e6' if v < 0 else '') for v in x], 
+                subset=['% Change']
+            ),
             use_container_width=True,
             hide_index=True
         )
