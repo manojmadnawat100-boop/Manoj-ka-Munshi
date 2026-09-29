@@ -279,12 +279,3 @@ if run_btn:
                 st.info("Chune gaye time period mein koi valid 36/72 setup trigger nahi hua.")
 else:
     st.info("👆 Stock symbol aur parameters select karke **Run Institutional Test** par click karein.")
-P&L Curve (%)")
-                st.line_chart(tdf.set_index("Exit Time")["Cumulative_PnL"])
-
-                st.subheader("📋 Trade Log")
-                st.dataframe(tdf, use_container_width=True, hide_index=True)
-            else:
-                st.info("Chune gaye time period mein koi trade trigger nahi hua.")
-else:
-    st.info("👆 Stock symbol aur parameters select karke **Run Institutional Test** par click karein.")
