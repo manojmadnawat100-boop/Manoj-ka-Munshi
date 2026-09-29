@@ -31,14 +31,14 @@ def get_keys():
 
 keys = get_keys()
 
-# --- Main Screen Controls (Mobile Friendly) ---
+# --- Main Screen Controls ---
 c1, c2, c3 = st.columns([2, 1, 1])
 with c1:
     symbol = st.text_input("NSE Stock Symbol", "SBIN").upper().strip()
 with c2:
     timeframe = st.selectbox("Timeframe", ["30minute", "15minute", "day"], index=0)
 with c3:
-    days = st.slider("Lookback Days", 30, 365, 120)
+    days = st.slider("Lookback Days", 30, 180, 90)
 
 with st.expander("⚙️ Risk, SL/Target & Friction Settings", expanded=False):
     r1, r2, r3, r4 = st.columns(4)
@@ -53,38 +53,61 @@ with st.expander("⚙️ Risk, SL/Target & Friction Settings", expanded=False):
 
 run_btn = st.button("🚀 Run Institutional Test", use_container_width=True)
 
-def fetch_data(ikey, tf, days_back):
-    to_date = datetime.now().strftime("%Y-%m-%d")
-    from_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
-
-    url = f"https://api.upstox.com/v2/historical-candle/{ikey}/{tf}/{to_date}/{from_date}"
-    res = requests.get(url, headers=HEADERS, timeout=15)
+def fetch_data_chunked(ikey, tf, total_days):
+    """
+    Upstox single request mein max 30 din ka intraday candle data deta hai.
+    Yeh function 28-din ke chunks mein divide karke full data collect karta hai.
+    """
+    all_candles = []
+    chunk_size = 28 if tf != "day" else 300
     
-    if res.status_code != 200:
-        return None, f"Upstox API Error (HTTP {res.status_code}): {res.text}"
-        
-    candles = res.json().get("data", {}).get("candles", [])
-    if len(candles) < 100:
-        return None, f"Data points kam hain ({len(candles)} candles mile). Lookback days badhayein ya dusra stock chunein."
+    current_to = datetime.now()
+    end_date = current_to - timedelta(days=total_days)
 
-    candles = list(reversed(candles))
-    df = pd.DataFrame(candles, columns=["ts", "o", "h", "l", "c", "v", "oi"])
+    while current_to > end_date:
+        current_from = max(current_to - timedelta(days=chunk_size), end_date)
+        to_str = current_to.strftime("%Y-%m-%d")
+        from_str = current_from.strftime("%Y-%m-%d")
+
+        url = f"https://api.upstox.com/v2/historical-candle/{ikey}/{tf}/{to_str}/{from_str}"
+        res = requests.get(url, headers=HEADERS, timeout=12)
+
+        if res.status_code != 200:
+            return None, f"Upstox API Error (HTTP {res.status_code}): {res.text}"
+
+        chunk = res.json().get("data", {}).get("candles", [])
+        if chunk:
+            all_candles.extend(chunk)
+
+        # Move window back
+        current_to = current_from - timedelta(days=1)
+
+    if len(all_candles) < 80:
+        return None, f"Data points kam hain ({len(all_candles)} candles mile). Stock liquid nahi hai ya date range kam hai."
+
+    # Remove duplicates if any and sort chronologically
+    df = pd.DataFrame(all_candles, columns=["ts", "o", "h", "l", "c", "v", "oi"])
+    df.drop_duplicates(subset=["ts"], inplace=True)
+    df["ts"] = pd.to_datetime(df["ts"])
+    df.sort_values("ts", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
     for col in ["o", "h", "l", "c", "v"]:
         df[col] = df[col].astype(float)
     return df, None
 
-# Execute on button click OR first load
+# Execute
 if run_btn or "backtest_loaded" not in st.session_state:
     st.session_state["backtest_loaded"] = True
 
     if not TOKEN:
         st.error("⚠️ Streamlit Secrets mein `UPSTOX_TOKEN` missing hai.")
     elif keys and symbol not in keys:
-        st.warning(f"'{symbol}' NSE list mein nahi mila. Jaise: SBIN, RELIANCE, TCS")
+        st.warning(f"'{symbol}' NSE list mein nahi mila. (e.g. SBIN, RELIANCE, TCS)")
     elif keys:
-        with st.spinner(f"{symbol} ka historical data load aur simulate ho raha hai..."):
+        with st.spinner(f"{symbol} ka multi-month historical data collect ho raha hai..."):
             ikey = keys[symbol]
-            df, err = fetch_data(ikey, timeframe, days)
+            df, err = fetch_data_chunked(ikey, timeframe, days)
 
         if err:
             st.error(err)
@@ -97,16 +120,15 @@ if run_btn or "backtest_loaded" not in st.session_state:
             trades = []
             pos = None
             friction = slippage_pct / 100.0
-            start_index = min(75, len(df) - 2)
+            start_index = min(72, len(df) - 2)
 
-            # Bar-by-bar Institutional Engine
             for i in range(start_index, len(df) - 1):
                 prev_diff = df["ema36"].iloc[i-1] - df["ema72"].iloc[i-1]
                 curr_diff = df["ema36"].iloc[i] - df["ema72"].iloc[i]
                 c_close = df["c"].iloc[i]
                 c_ema200 = df["ema200"].iloc[i]
 
-                # 1. Active Position Check (Intrabar High/Low Fill)
+                # 1. Manage Active Position (Intrabar Fill)
                 if pos is not None:
                     high = df["h"].iloc[i]
                     low = df["l"].iloc[i]
@@ -182,7 +204,7 @@ if run_btn or "backtest_loaded" not in st.session_state:
                             "time": next_time
                         }
 
-            # 3. Output Metrics & Dashboard
+            # 3. Output Performance Analytics
             if trades:
                 tdf = pd.DataFrame(trades)
                 tdf["Cumulative_PnL"] = tdf["PnL %"].cumsum()
@@ -209,7 +231,7 @@ if run_btn or "backtest_loaded" not in st.session_state:
                 st.subheader("📈 Realized Cumulative Returns (%)")
                 st.line_chart(tdf.set_index("Exit Time")["Cumulative_PnL"])
 
-                st.subheader("📋 Trade Log")
+                st.subheader("📋 Trade Log Details")
                 st.dataframe(tdf, use_container_width=True, hide_index=True)
             else:
-                st.info("Chune gaye time period mein koi valid 36/72 setup trigger nahi hua.")
+                st.info("Chune gaye time period aur parameters par koi trade trigger nahi hua.")
