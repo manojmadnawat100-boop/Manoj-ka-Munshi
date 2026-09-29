@@ -54,27 +54,48 @@ with st.expander("⚙️ Risk, SL/Target & Friction Settings", expanded=False):
 
 run_btn = st.button("🚀 Run Institutional Test", use_container_width=True)
 
-# Cache historical data for 10 minutes so repeated scans don't hit Upstox API
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_data_chunked(ikey, tf, total_days):
+    # 1. DAILY TIMEFRAME: Direct historical endpoint with minimum 365 days
+    if tf == "day":
+        to_str = datetime.now().strftime("%Y-%m-%d")
+        lookback = max(total_days, 365)
+        from_str = (datetime.now() - timedelta(days=lookback)).strftime("%Y-%m-%d")
+        
+        url = f"https://api.upstox.com/v2/historical-candle/{ikey}/day/{to_str}/{from_str}"
+        res = requests.get(url, headers=HEADERS, timeout=12)
+        if res.status_code != 200:
+            return None, f"Upstox Day Error: {res.text}"
+            
+        candles = res.json().get("data", {}).get("candles", [])
+        if len(candles) < 75:
+            return None, f"Daily candles kam hain ({len(candles)} candles mile). Lookback badhayein."
+            
+        df = pd.DataFrame(list(reversed(candles)), columns=["ts", "o", "h", "l", "c", "v", "oi"])
+        df["ts"] = pd.to_datetime(df["ts"])
+        for col in ["o", "h", "l", "c", "v"]:
+            df[col] = df[col].astype(float)
+        return df, None
+
+    # 2. INTRADAY TIMEFRAME: 30minute direct ya 15minute via 1minute resampling
+    api_interval = "30minute" if tf == "30minute" else "1minute"
+    chunk_days = 25 if api_interval == "30minute" else 6
+    effective_days = min(total_days, 40) if tf == "15minute" else total_days
+
     all_candles = []
-    chunk_size = 28 if tf != "day" else 300
-    
     current_to = datetime.now()
-    end_date = current_to - timedelta(days=total_days)
+    end_date = current_to - timedelta(days=effective_days)
 
     while current_to > end_date:
-        current_from = max(current_to - timedelta(days=chunk_size), end_date)
+        current_from = max(current_to - timedelta(days=chunk_days), end_date)
         to_str = current_to.strftime("%Y-%m-%d")
         from_str = current_from.strftime("%Y-%m-%d")
 
-        url = f"https://api.upstox.com/v2/historical-candle/{ikey}/{tf}/{to_str}/{from_str}"
+        url = f"https://api.upstox.com/v2/historical-candle/{ikey}/{api_interval}/{to_str}/{from_str}"
         
-        # Retry logic with backoff for rate-limit safety
         success = False
         for attempt in range(3):
             res = requests.get(url, headers=HEADERS, timeout=12)
-            
             if res.status_code == 200:
                 chunk = res.json().get("data", {}).get("candles", [])
                 if chunk:
@@ -82,39 +103,51 @@ def fetch_data_chunked(ikey, tf, total_days):
                 success = True
                 break
             elif res.status_code == 429:
-                # Rate limited: wait and retry
                 time.sleep(2.5 * (attempt + 1))
             else:
                 return None, f"Upstox API Error (HTTP {res.status_code}): {res.text}"
 
         if not success:
-            return None, "Rate limit block lag gaya. Kripya 20-30 second wait karke dobara run karein."
+            return None, "Rate limit hit ho gaya. Kripya 20 second baad try karein."
 
-        # Polite delay to prevent Cloudflare 429
         time.sleep(0.35)
         current_to = current_from - timedelta(days=1)
 
-    if len(all_candles) < 75:
-        return None, f"Data points kam mile ({len(all_candles)} candles). Stock liquid nahi hai ya date range choti hai."
+    if not all_candles:
+        return None, "Candle data nahi mila."
 
     df = pd.DataFrame(all_candles, columns=["ts", "o", "h", "l", "c", "v", "oi"])
     df.drop_duplicates(subset=["ts"], inplace=True)
     df["ts"] = pd.to_datetime(df["ts"])
     df.sort_values("ts", inplace=True)
     df.reset_index(drop=True, inplace=True)
-
     for col in ["o", "h", "l", "c", "v"]:
         df[col] = df[col].astype(float)
+
+    # 15-minute timeframe resampling
+    if tf == "15minute":
+        df.set_index("ts", inplace=True)
+        df = df.resample("15min").agg({
+            "o": "first",
+            "h": "max",
+            "l": "min",
+            "c": "last",
+            "v": "sum"
+        }).dropna().reset_index()
+
+    if len(df) < 75:
+        return None, f"Candles count kam mila ({len(df)} candles). Timeframe/Days adjust karein."
+
     return df, None
 
-# Execute on click
+# Run Simulation
 if run_btn:
     if not TOKEN:
         st.error("⚠️ Streamlit Secrets mein `UPSTOX_TOKEN` missing hai.")
     elif keys and symbol not in keys:
         st.warning(f"'{symbol}' NSE list mein nahi mila. (e.g. SBIN, RELIANCE, TCS)")
     elif keys:
-        with st.spinner(f"{symbol} ka historical data load aur verify ho raha hai..."):
+        with st.spinner(f"{symbol} ({timeframe}) ka data load aur simulate ho raha hai..."):
             ikey = keys[symbol]
             df, err = fetch_data_chunked(ikey, timeframe, days)
 
@@ -137,7 +170,7 @@ if run_btn:
                 c_close = df["c"].iloc[i]
                 c_ema200 = df["ema200"].iloc[i]
 
-                # 1. Manage Active Position (Intrabar High/Low Fill)
+                # 1. Manage Active Position (Intrabar High/Low fill)
                 if pos is not None:
                     high = df["h"].iloc[i]
                     low = df["l"].iloc[i]
@@ -213,7 +246,7 @@ if run_btn:
                             "time": next_time
                         }
 
-            # 3. Analytics Dashboard
+            # 3. Output Analytics Dashboard
             if trades:
                 tdf = pd.DataFrame(trades)
                 tdf["Cumulative_PnL"] = tdf["PnL %"].cumsum()
@@ -238,6 +271,15 @@ if run_btn:
                 m5.metric("Max Drawdown", f"{max_drawdown:.2f}%")
 
                 st.subheader("📈 Cumulative P&L Curve (%)")
+                st.line_chart(tdf.set_index("Exit Time")["Cumulative_PnL"])
+
+                st.subheader("📋 Trade Log")
+                st.dataframe(tdf, use_container_width=True, hide_index=True)
+            else:
+                st.info("Chune gaye time period mein koi valid 36/72 setup trigger nahi hua.")
+else:
+    st.info("👆 Stock symbol aur parameters select karke **Run Institutional Test** par click karein.")
+P&L Curve (%)")
                 st.line_chart(tdf.set_index("Exit Time")["Cumulative_PnL"])
 
                 st.subheader("📋 Trade Log")
