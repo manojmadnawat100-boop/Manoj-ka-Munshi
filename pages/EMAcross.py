@@ -16,7 +16,7 @@ TG_TOKEN = st.secrets.get("TELEGRAM_TOKEN", "")
 TG_CHAT = st.secrets.get("TELEGRAM_CHAT_ID", "")
 
 HEADERS = {
-    "Authorization": f"Bearer {TOKEN}",
+    "Authorization": f"Bearer {TOKEN.strip()}",
     "Accept": "application/json"
 }
 
@@ -44,12 +44,12 @@ def get_keys():
         d = dict(zip(inst[tc], inst["instrument_key"]))
         return {s: d[s] for s in WATCHLIST if s in d}
     except Exception as e:
-        st.error(f"Instruments list download error: {e}")
+        st.error(f"Instruments file fetch fail hui: {e}")
         return {}
 
 def fetch_candles(ikey: str, interval: str, tf: str):
     to_date = datetime.now().strftime("%Y-%m-%d")
-    days_back = 15 if tf == "5m" else 30
+    days_back = 10 if tf == "5m" else 20
     from_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
 
     encoded_key = urllib.parse.quote(ikey, safe="")
@@ -57,60 +57,43 @@ def fetch_candles(ikey: str, interval: str, tf: str):
     
     try:
         res = requests.get(url, headers=HEADERS, timeout=10)
-        if res.status_code == 401:
-            st.session_state["api_error"] = "🔴 Token Expire ho chuka hai! Naya UPSTOX_TOKEN daalein."
-            return None
-        elif res.status_code != 200:
-            st.session_state["api_error"] = f"API Error ({res.status_code}): {res.text}"
-            return None
+        if res.status_code != 200:
+            return None, f"HTTP {res.status_code}: {res.text}"
 
         data = res.json().get("data", {}).get("candles", [])
-        # Kam se kam 80 candles required hain basic calculation ke liye
-        if len(data) < 80:
-            return None
+        if len(data) < 75:
+            return None, f"Candles count kam hai ({len(data)} candles mile)"
 
-        # Chronological order mein arrange karo
         data = list(reversed(data))
         df = pd.DataFrame(data, columns=["ts", "o", "h", "l", "c", "v", "oi"])
         for col in ["o", "h", "l", "c", "v"]:
             df[col] = df[col].astype(float)
-        return df
+        return df, None
     except Exception as e:
-        logging.error(f"Fetch network error for {ikey}: {e}")
-        return None
+        return None, str(e)
 
 def analyze_institutional_signal(args):
     sym, ikey, tf = args
-    # Upstox API V2 exact endpoint format: '15minute' aur '5minute'
     interval = "15minute" if tf == "15m" else "5minute"
 
-    try:
-        df = fetch_candles(ikey, interval, tf)
-        if df is None or df.empty:
-            return None
+    df, err = fetch_candles(ikey, interval, tf)
+    if df is None:
+        return {"Symbol": sym, "Error": err}
 
+    try:
         df["ema36"] = df["c"].ewm(span=36, adjust=False).mean()
         df["ema72"] = df["c"].ewm(span=72, adjust=False).mean()
-        # Agar candles 200 se zyada hain tabhi ema200 calculate karo
-        has_200 = len(df) >= 200
-        if has_200:
-            df["ema200"] = df["c"].ewm(span=200, adjust=False).mean()
-        else:
-            df["ema200"] = df["c"].ewm(span=len(df), adjust=False).mean()
-
+        df["ema200"] = df["c"].ewm(span=min(len(df), 200), adjust=False).mean()
         df["vol_sma"] = df["v"].rolling(window=20).mean()
 
-        # Closed candle selection
         now_time = datetime.now().time()
         market_open = datetime.strptime("09:15", "%H:%M").time()
         market_close = datetime.strptime("15:30", "%H:%M").time()
 
         if market_open <= now_time <= market_close:
-            curr_idx = -2
-            prev_idx = -3
+            curr_idx, prev_idx = -2, -3
         else:
-            curr_idx = -1
-            prev_idx = -2
+            curr_idx, prev_idx = -1, -2
 
         prev = df.iloc[prev_idx]
         curr = df.iloc[curr_idx]
@@ -123,7 +106,6 @@ def analyze_institutional_signal(args):
         signal = "NONE"
         quality = "Neutral"
 
-        # Bullish Crossover
         if prev_diff <= 0 and curr_diff > 0:
             if curr["c"] > curr["ema200"] and volume_confirmed:
                 signal = "🟢 HIGH-CONVICTION BULLISH"
@@ -135,7 +117,6 @@ def analyze_institutional_signal(args):
                 signal = "⚠️ COUNTER-TREND BULLISH"
                 quality = "Weak (Below 200 EMA)"
 
-        # Bearish Crossover
         elif prev_diff >= 0 and curr_diff < 0:
             if curr["c"] < curr["ema200"] and volume_confirmed:
                 signal = "🔴 HIGH-CONVICTION BEARISH"
@@ -156,11 +137,11 @@ def analyze_institutional_signal(args):
             "Volume Surge": "✅ Yes" if volume_confirmed else "❌ No",
             "Signal": signal,
             "Quality": quality,
-            "Candle Time": str(curr["ts"])[:16]
+            "Candle Time": str(curr["ts"])[:16],
+            "Error": None
         }
     except Exception as e:
-        logging.error(f"Processing error on {sym}: {e}")
-        return None
+        return {"Symbol": sym, "Error": str(e)}
 
 # --- UI Controls ---
 col1, col2 = st.columns([3, 1])
@@ -171,22 +152,26 @@ with col2:
     st.write("")
     scan_btn = st.button("🔄 Run Scanner", use_container_width=True)
 
-st.session_state["api_error"] = None
 keys = get_keys()
 
-if scan_btn or "initial_run" not in st.session_state:
-    st.session_state["initial_run"] = True
+if scan_btn or "app_started" not in st.session_state:
+    st.session_state["app_started"] = True
 
     if not TOKEN:
-        st.error("⚠️ Streamlit Secrets mein `UPSTOX_TOKEN` enter karein.")
-    elif keys:
-        with st.spinner("Upstox se live candles fetch aur analyze ho rahi hain..."):
+        st.error("⚠️ Streamlit Secrets mein `UPSTOX_TOKEN` missing hai.")
+    elif not keys:
+        st.error("⚠️ Watchlist ke instruments fetch nahi ho paye.")
+    else:
+        with st.spinner("Market candles analyze ki ja rahi hain..."):
             with ThreadPoolExecutor(max_workers=5) as executor:
                 tasks = [(sym, key, tf) for sym, key in keys.items()]
-                results = [res for res in executor.map(analyze_institutional_signal, tasks) if res]
+                results = list(executor.map(analyze_institutional_signal, tasks))
 
-        if results:
-            res_df = pd.DataFrame(results)
+        valid_results = [r for r in results if r and r.get("Error") is None]
+        errors = [r for r in results if r and r.get("Error")]
+
+        if valid_results:
+            res_df = pd.DataFrame(valid_results)
             signals_df = res_df[res_df["Signal"] != "NONE"]
 
             if not signals_df.empty:
@@ -207,12 +192,11 @@ if scan_btn or "initial_run" not in st.session_state:
                             send_tg(msg)
                             st.session_state[alert_id] = True
             else:
-                st.info("ℹ️ Abhi watchlist mein koi fresh 36/72 EMA crossover trigger nahi hua hai.")
+                st.info("ℹ️ Abhi watchlist mein koi fresh 36/72 crossover trigger nahi hua hai.")
 
-            with st.expander("📊 All Watchlist Stocks Status (Live)", expanded=True):
+            with st.expander("📊 Complete Watchlist Status", expanded=True):
                 st.dataframe(res_df.sort_values("Symbol"), use_container_width=True, hide_index=True)
         else:
-            if st.session_state.get("api_error"):
-                st.error(st.session_state["api_error"])
-            else:
-                st.error("Data fetch nahi ho saka. Upstox access token daily morning expire hota hai, naya generate karke Streamlit Secrets mein update karein.")
+            st.error("Data fetch nahi hua. Niche Upstox ka exact response dekhein:")
+            for err in errors[:3]:
+                st.code(f"{err['Symbol']}: {err['Error']}")
