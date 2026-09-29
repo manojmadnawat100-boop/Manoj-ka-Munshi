@@ -66,9 +66,10 @@ def fetch_live_data(instrument_dict):
         results = []
         
         for symbol, ikey in instrument_dict.items():
-            if ikey in data:
-                quote = data[ikey]
-                
+            # Upstox returns keys like 'NSE_EQ:HDFCBANK' or standard ikey
+            quote = data.get(f"NSE_EQ:{symbol}") or data.get(ikey)
+            
+            if quote:
                 ltp = quote.get("last_price", 0)
                 ohlc = quote.get("ohlc", {})
                 prev_close = ohlc.get("close", 1) 
@@ -93,15 +94,15 @@ def fetch_live_data(instrument_dict):
                     "Share": symbol,
                     "LTP (₹)": ltp,
                     "% Change": round(price_change, 2),
-                    "Pending Buy Qty": buy_qty,
-                    "Pending Sell Qty": sell_qty,
-                    "Volume": volume,
+                    "Pending Buy Qty": int(buy_qty),
+                    "Pending Sell Qty": int(sell_qty),
+                    "Volume": int(volume),
                     "Order Trend": order_trend,
                     "Strength": strength
                 })
                 
         if not results:
-             return None, f"Data match nahi hua. Upstox response: {raw_response}"
+            return None, f"Data parse nahi ho paya. Upstox response keys: {list(data.keys())}"
              
         return results, None
     except Exception as e:
@@ -124,7 +125,6 @@ def live_dashboard():
         if st.button("🔄 Abhi Refresh Karein"):
             st.rerun()
             
-    # Built-in timezone offset for IST (UTC + 5:30)
     ist_offset = timezone(timedelta(hours=5, minutes=30))
     current_time = datetime.now(ist_offset).strftime('%H:%M:%S')
     st.caption(f"Aakhri Update (IST): {current_time}")
@@ -135,7 +135,7 @@ def live_dashboard():
         if error == "TOKEN EXPIRED":
             st.error("Token expire ho gaya hai. Naya UPSTOX_TOKEN generate karke dalein.")
         else:
-            st.error(f"API Error/Debug: {error}")
+            st.error(f"API Error: {error}")
         return
         
     if data:
