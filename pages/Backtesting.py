@@ -1,4 +1,5 @@
 import logging
+import time
 from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
@@ -31,7 +32,7 @@ def get_keys():
 
 keys = get_keys()
 
-# --- Main Screen Controls ---
+# --- Main Controls ---
 c1, c2, c3 = st.columns([2, 1, 1])
 with c1:
     symbol = st.text_input("NSE Stock Symbol", "SBIN").upper().strip()
@@ -53,11 +54,9 @@ with st.expander("⚙️ Risk, SL/Target & Friction Settings", expanded=False):
 
 run_btn = st.button("🚀 Run Institutional Test", use_container_width=True)
 
+# Cache historical data for 10 minutes so repeated scans don't hit Upstox API
+@st.cache_data(ttl=600, show_spinner=False)
 def fetch_data_chunked(ikey, tf, total_days):
-    """
-    Upstox single request mein max 30 din ka intraday candle data deta hai.
-    Yeh function 28-din ke chunks mein divide karke full data collect karta hai.
-    """
     all_candles = []
     chunk_size = 28 if tf != "day" else 300
     
@@ -70,22 +69,34 @@ def fetch_data_chunked(ikey, tf, total_days):
         from_str = current_from.strftime("%Y-%m-%d")
 
         url = f"https://api.upstox.com/v2/historical-candle/{ikey}/{tf}/{to_str}/{from_str}"
-        res = requests.get(url, headers=HEADERS, timeout=12)
+        
+        # Retry logic with backoff for rate-limit safety
+        success = False
+        for attempt in range(3):
+            res = requests.get(url, headers=HEADERS, timeout=12)
+            
+            if res.status_code == 200:
+                chunk = res.json().get("data", {}).get("candles", [])
+                if chunk:
+                    all_candles.extend(chunk)
+                success = True
+                break
+            elif res.status_code == 429:
+                # Rate limited: wait and retry
+                time.sleep(2.5 * (attempt + 1))
+            else:
+                return None, f"Upstox API Error (HTTP {res.status_code}): {res.text}"
 
-        if res.status_code != 200:
-            return None, f"Upstox API Error (HTTP {res.status_code}): {res.text}"
+        if not success:
+            return None, "Rate limit block lag gaya. Kripya 20-30 second wait karke dobara run karein."
 
-        chunk = res.json().get("data", {}).get("candles", [])
-        if chunk:
-            all_candles.extend(chunk)
-
-        # Move window back
+        # Polite delay to prevent Cloudflare 429
+        time.sleep(0.35)
         current_to = current_from - timedelta(days=1)
 
-    if len(all_candles) < 80:
-        return None, f"Data points kam hain ({len(all_candles)} candles mile). Stock liquid nahi hai ya date range kam hai."
+    if len(all_candles) < 75:
+        return None, f"Data points kam mile ({len(all_candles)} candles). Stock liquid nahi hai ya date range choti hai."
 
-    # Remove duplicates if any and sort chronologically
     df = pd.DataFrame(all_candles, columns=["ts", "o", "h", "l", "c", "v", "oi"])
     df.drop_duplicates(subset=["ts"], inplace=True)
     df["ts"] = pd.to_datetime(df["ts"])
@@ -96,16 +107,14 @@ def fetch_data_chunked(ikey, tf, total_days):
         df[col] = df[col].astype(float)
     return df, None
 
-# Execute
-if run_btn or "backtest_loaded" not in st.session_state:
-    st.session_state["backtest_loaded"] = True
-
+# Execute on click
+if run_btn:
     if not TOKEN:
         st.error("⚠️ Streamlit Secrets mein `UPSTOX_TOKEN` missing hai.")
     elif keys and symbol not in keys:
         st.warning(f"'{symbol}' NSE list mein nahi mila. (e.g. SBIN, RELIANCE, TCS)")
     elif keys:
-        with st.spinner(f"{symbol} ka multi-month historical data collect ho raha hai..."):
+        with st.spinner(f"{symbol} ka historical data load aur verify ho raha hai..."):
             ikey = keys[symbol]
             df, err = fetch_data_chunked(ikey, timeframe, days)
 
@@ -128,7 +137,7 @@ if run_btn or "backtest_loaded" not in st.session_state:
                 c_close = df["c"].iloc[i]
                 c_ema200 = df["ema200"].iloc[i]
 
-                # 1. Manage Active Position (Intrabar Fill)
+                # 1. Manage Active Position (Intrabar High/Low Fill)
                 if pos is not None:
                     high = df["h"].iloc[i]
                     low = df["l"].iloc[i]
@@ -175,7 +184,7 @@ if run_btn or "backtest_loaded" not in st.session_state:
                         })
                         pos = None
 
-                # 2. Entry Execution on Next-Bar Open
+                # 2. Next-Bar Open Execution
                 if pos is None:
                     next_open = df["o"].iloc[i+1]
                     next_time = df["ts"].iloc[i+1]
@@ -204,7 +213,7 @@ if run_btn or "backtest_loaded" not in st.session_state:
                             "time": next_time
                         }
 
-            # 3. Output Performance Analytics
+            # 3. Analytics Dashboard
             if trades:
                 tdf = pd.DataFrame(trades)
                 tdf["Cumulative_PnL"] = tdf["PnL %"].cumsum()
@@ -228,10 +237,12 @@ if run_btn or "backtest_loaded" not in st.session_state:
                 m4.metric("Profit Factor", f"{profit_factor:.2f}" if not np.isnan(profit_factor) else "N/A")
                 m5.metric("Max Drawdown", f"{max_drawdown:.2f}%")
 
-                st.subheader("📈 Realized Cumulative Returns (%)")
+                st.subheader("📈 Cumulative P&L Curve (%)")
                 st.line_chart(tdf.set_index("Exit Time")["Cumulative_PnL"])
 
-                st.subheader("📋 Trade Log Details")
+                st.subheader("📋 Trade Log")
                 st.dataframe(tdf, use_container_width=True, hide_index=True)
             else:
-                st.info("Chune gaye time period aur parameters par koi trade trigger nahi hua.")
+                st.info("Chune gaye time period mein koi trade trigger nahi hua.")
+else:
+    st.info("👆 Stock symbol aur parameters select karke **Run Institutional Test** par click karein.")
