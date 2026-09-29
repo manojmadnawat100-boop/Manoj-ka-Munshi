@@ -1,9 +1,8 @@
 import time
+from datetime import datetime, timezone, timedelta
 import pandas as pd
 import requests
 import streamlit as st
-import pytz
-from datetime import datetime
 
 # ---------------- Page Config ----------------
 st.set_page_config(page_title="Bank Nifty Live Scanner", layout="wide")
@@ -56,7 +55,6 @@ def fetch_live_data(instrument_dict):
     keys_str = ",".join(instrument_dict.values())
     
     try:
-        # FIXED: URL param encoding theek karne ke liye params={} use kiya
         r = requests.get(QUOTE_URL, headers=HEADERS, params={"instrument_key": keys_str}, timeout=10)
         
         if r.status_code == 401:
@@ -102,9 +100,8 @@ def fetch_live_data(instrument_dict):
                     "Strength": strength
                 })
                 
-        # FIXED: Agar list khali hai toh raw data return karo taaki error dikhe
         if not results:
-             return None, f"Data match nahi hua. Upstox ne ye bheja hai: {raw_response}"
+             return None, f"Data match nahi hua. Upstox response: {raw_response}"
              
         return results, None
     except Exception as e:
@@ -127,9 +124,9 @@ def live_dashboard():
         if st.button("🔄 Abhi Refresh Karein"):
             st.rerun()
             
-    # FIXED: Timezone ko IST mein convert kiya
-    ist = pytz.timezone('Asia/Kolkata')
-    current_time = datetime.now(ist).strftime('%H:%M:%S')
+    # Built-in timezone offset for IST (UTC + 5:30)
+    ist_offset = timezone(timedelta(hours=5, minutes=30))
+    current_time = datetime.now(ist_offset).strftime('%H:%M:%S')
     st.caption(f"Aakhri Update (IST): {current_time}")
     
     data, error = fetch_live_data(instrument_keys)
