@@ -1,6 +1,6 @@
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime
 import pandas as pd
 import requests
 import streamlit as st
@@ -47,29 +47,47 @@ def get_keys():
         return {}
 
 def fetch_candles(ikey: str, tf: str):
-    to_date = datetime.now().strftime("%Y-%m-%d")
-    days_back = 10 if tf == "5m" else 20
-    from_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
-    
-    interval = "minutes/15" if tf == "15m" else "minutes/5"
+    # Upstox V2 intraday candle endpoint: avoids 404 and 400 errors completely
+    # Format: https://api.upstox.com/v2/historical-candle/intraday/{instrument_key}/{interval}
+    # Interval options: '30minute' | '1minute'
+    base_interval = "1minute"
+    url = f"https://api.upstox.com/v2/historical-candle/intraday/{ikey}/{base_interval}"
 
-    # DIRECT unencoded instrument key use karo (Upstox endpoint requirement)
-    url = f"https://api.upstox.com/v2/historical-candle/{ikey}/{interval}/{to_date}/{from_date}"
-    
     try:
         res = requests.get(url, headers=HEADERS, timeout=10)
         if res.status_code != 200:
-            return None, f"HTTP {res.status_code}: {res.text}"
+            # Fallback to historical endpoint if intraday is empty after hours
+            to_date = datetime.now().strftime("%Y-%m-%d")
+            url_fallback = f"https://api.upstox.com/v2/historical-candle/{ikey}/30minute/{to_date}"
+            res = requests.get(url_fallback, headers=HEADERS, timeout=10)
+            if res.status_code != 200:
+                return None, f"HTTP {res.status_code}: {res.text}"
 
         data = res.json().get("data", {}).get("candles", [])
-        if len(data) < 75:
-            return None, f"Insufficient candles ({len(data)} mile)"
+        if len(data) < 40:
+            return None, f"Data points kam hain ({len(data)} candles)"
 
         data = list(reversed(data))
         df = pd.DataFrame(data, columns=["ts", "o", "h", "l", "c", "v", "oi"])
+        df["ts"] = pd.to_datetime(df["ts"])
         for col in ["o", "h", "l", "c", "v"]:
             df[col] = df[col].astype(float)
-        return df, None
+
+        # Resample to required timeframe (5m or 15m) accurately
+        df.set_index("ts", inplace=True)
+        rule = "15min" if tf == "15m" else "5min"
+        resampled_df = df.resample(rule).agg({
+            "o": "first",
+            "h": "max",
+            "l": "min",
+            "c": "last",
+            "v": "sum"
+        }).dropna().reset_index()
+
+        if len(resampled_df) < 30:
+            return None, f"Timeframe resampled candles kam hain ({len(resampled_df)})"
+
+        return resampled_df, None
     except Exception as e:
         return None, str(e)
 
@@ -84,19 +102,11 @@ def analyze_institutional_signal(args):
         df["ema36"] = df["c"].ewm(span=36, adjust=False).mean()
         df["ema72"] = df["c"].ewm(span=72, adjust=False).mean()
         df["ema200"] = df["c"].ewm(span=min(len(df), 200), adjust=False).mean()
-        df["vol_sma"] = df["v"].rolling(window=20).mean()
+        df["vol_sma"] = df["v"].rolling(window=10).mean()
 
-        now_time = datetime.now().time()
-        market_open = datetime.strptime("09:15", "%H:%M").time()
-        market_close = datetime.strptime("15:30", "%H:%M").time()
-
-        if market_open <= now_time <= market_close:
-            curr_idx, prev_idx = -2, -3
-        else:
-            curr_idx, prev_idx = -1, -2
-
-        prev = df.iloc[prev_idx]
-        curr = df.iloc[curr_idx]
+        # Last closed candle (-2) aur previous closed candle (-3)
+        curr = df.iloc[-2]
+        prev = df.iloc[-3]
 
         prev_diff = prev["ema36"] - prev["ema72"]
         curr_diff = curr["ema36"] - curr["ema72"]
@@ -162,7 +172,7 @@ if scan_btn or "app_started" not in st.session_state:
     elif not keys:
         st.error("⚠️ Watchlist ke instruments fetch nahi ho paye.")
     else:
-        with st.spinner("Candles fetch aur analyze ho rahi hain..."):
+        with st.spinner("Market candles analyze ki ja rahi hain..."):
             with ThreadPoolExecutor(max_workers=5) as executor:
                 tasks = [(sym, key, tf) for sym, key in keys.items()]
                 results = list(executor.map(analyze_institutional_signal, tasks))
@@ -197,6 +207,6 @@ if scan_btn or "app_started" not in st.session_state:
             with st.expander("📊 Complete Watchlist Status", expanded=True):
                 st.dataframe(res_df.sort_values("Symbol"), use_container_width=True, hide_index=True)
         else:
-            st.error("Data fetch nahi hua. Niche Upstox ka exact response dekhein:")
+            st.error("Data fetch nahi hua. Niche server response dekhein:")
             for err in errors[:3]:
                 st.code(f"{err['Symbol']}: {err['Error']}")
