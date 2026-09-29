@@ -1,5 +1,4 @@
 import logging
-import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 import pandas as pd
@@ -47,13 +46,15 @@ def get_keys():
         st.error(f"Instruments file fetch fail hui: {e}")
         return {}
 
-def fetch_candles(ikey: str, interval: str, tf: str):
+def fetch_candles(ikey: str, tf: str):
     to_date = datetime.now().strftime("%Y-%m-%d")
     days_back = 10 if tf == "5m" else 20
     from_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+    
+    interval = "minutes/15" if tf == "15m" else "minutes/5"
 
-    encoded_key = urllib.parse.quote(ikey, safe="")
-    url = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/{interval}/{to_date}/{from_date}"
+    # DIRECT unencoded instrument key use karo (Upstox endpoint requirement)
+    url = f"https://api.upstox.com/v2/historical-candle/{ikey}/{interval}/{to_date}/{from_date}"
     
     try:
         res = requests.get(url, headers=HEADERS, timeout=10)
@@ -62,7 +63,7 @@ def fetch_candles(ikey: str, interval: str, tf: str):
 
         data = res.json().get("data", {}).get("candles", [])
         if len(data) < 75:
-            return None, f"Candles count kam hai ({len(data)} candles mile)"
+            return None, f"Insufficient candles ({len(data)} mile)"
 
         data = list(reversed(data))
         df = pd.DataFrame(data, columns=["ts", "o", "h", "l", "c", "v", "oi"])
@@ -74,9 +75,8 @@ def fetch_candles(ikey: str, interval: str, tf: str):
 
 def analyze_institutional_signal(args):
     sym, ikey, tf = args
-    interval = "15minute" if tf == "15m" else "5minute"
 
-    df, err = fetch_candles(ikey, interval, tf)
+    df, err = fetch_candles(ikey, tf)
     if df is None:
         return {"Symbol": sym, "Error": err}
 
@@ -162,7 +162,7 @@ if scan_btn or "app_started" not in st.session_state:
     elif not keys:
         st.error("⚠️ Watchlist ke instruments fetch nahi ho paye.")
     else:
-        with st.spinner("Market candles analyze ki ja rahi hain..."):
+        with st.spinner("Candles fetch aur analyze ho rahi hain..."):
             with ThreadPoolExecutor(max_workers=5) as executor:
                 tasks = [(sym, key, tf) for sym, key in keys.items()]
                 results = list(executor.map(analyze_institutional_signal, tasks))
