@@ -2,6 +2,8 @@ import time
 import pandas as pd
 import requests
 import streamlit as st
+import pytz
+from datetime import datetime
 
 # ---------------- Page Config ----------------
 st.set_page_config(page_title="Bank Nifty Live Scanner", layout="wide")
@@ -26,21 +28,17 @@ BANK_NIFTY_SYMBOLS = [
 @st.cache_data(ttl=86400)
 def get_instrument_keys():
     try:
-        # Pura DataFrame load karein
         inst = pd.read_json("https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz")
         
-        # Upstox API updates ko handle karne ke liye column check aur rename logic
         if 'trading_symbol' in inst.columns:
             inst.rename(columns={'trading_symbol': 'tradingsymbol'}, inplace=True)
         elif 'name' in inst.columns and 'tradingsymbol' not in inst.columns:
             inst.rename(columns={'name': 'tradingsymbol'}, inplace=True)
             
-        # Agar error abhi bhi hai, toh exact columns screen par dikhayega
         if 'tradingsymbol' not in inst.columns:
-            st.error(f"Instrument format badal gaya hai. Available columns yeh hain: {inst.columns.tolist()}")
+            st.error(f"Instrument format badal gaya hai. Available columns: {inst.columns.tolist()}")
             return {}
 
-        # Safely filter conditions apply karein
         if 'segment' in inst.columns and 'instrument_type' in inst.columns:
             inst = inst[(inst["segment"] == "NSE_EQ") & (inst["instrument_type"] == "EQ")]
         
@@ -58,22 +56,22 @@ def fetch_live_data(instrument_dict):
     keys_str = ",".join(instrument_dict.values())
     
     try:
-        r = requests.get(f"{QUOTE_URL}?instrument_key={keys_str}", headers=HEADERS, timeout=10)
+        # FIXED: URL param encoding theek karne ke liye params={} use kiya
+        r = requests.get(QUOTE_URL, headers=HEADERS, params={"instrument_key": keys_str}, timeout=10)
+        
         if r.status_code == 401:
             return None, "TOKEN EXPIRED"
         r.raise_for_status()
         
-        data = r.json().get("data", {})
+        raw_response = r.json()
+        data = raw_response.get("data", {})
         results = []
         
         for symbol, ikey in instrument_dict.items():
             if ikey in data:
                 quote = data[ikey]
                 
-                # Live data points
                 ltp = quote.get("last_price", 0)
-                
-                # Previous close 'ohlc' ke andar hota hai
                 ohlc = quote.get("ohlc", {})
                 prev_close = ohlc.get("close", 1) 
                 
@@ -81,10 +79,8 @@ def fetch_live_data(instrument_dict):
                 sell_qty = quote.get("total_sell_quantity", 0)
                 volume = quote.get("volume", 0)
                 
-                # Price Trend 
                 price_change = ((ltp - prev_close) / prev_close) * 100
                 
-                # Volume Side & Pending Order Logic
                 if buy_qty > sell_qty:
                     order_trend = "🟢 Buyers Jyada"
                     strength = 1
@@ -106,6 +102,10 @@ def fetch_live_data(instrument_dict):
                     "Strength": strength
                 })
                 
+        # FIXED: Agar list khali hai toh raw data return karo taaki error dikhe
+        if not results:
+             return None, f"Data match nahi hua. Upstox ne ye bheja hai: {raw_response}"
+             
         return results, None
     except Exception as e:
         return None, str(e)
@@ -118,9 +118,8 @@ if not TOKEN:
 instrument_keys = get_instrument_keys()
 
 if not instrument_keys:
-    st.stop() # Error message ab direct function ke andar se dikhega
+    st.stop() 
 
-# Auto Refresh logic 
 @st.fragment(run_every=60)
 def live_dashboard():
     col1, col2 = st.columns([3, 1])
@@ -128,7 +127,10 @@ def live_dashboard():
         if st.button("🔄 Abhi Refresh Karein"):
             st.rerun()
             
-    st.caption(f"Aakhri Update: {time.strftime('%H:%M:%S')}")
+    # FIXED: Timezone ko IST mein convert kiya
+    ist = pytz.timezone('Asia/Kolkata')
+    current_time = datetime.now(ist).strftime('%H:%M:%S')
+    st.caption(f"Aakhri Update (IST): {current_time}")
     
     data, error = fetch_live_data(instrument_keys)
     
@@ -136,13 +138,12 @@ def live_dashboard():
         if error == "TOKEN EXPIRED":
             st.error("Token expire ho gaya hai. Naya UPSTOX_TOKEN generate karke dalein.")
         else:
-            st.error(f"API Error: {error}")
+            st.error(f"API Error/Debug: {error}")
         return
         
     if data:
         df = pd.DataFrame(data)
         
-        # ---------------- Overall Bank Nifty Trend Calculation ----------------
         total_shares = len(df)
         positive_shares = len(df[df["Strength"] == 1])
         negative_shares = len(df[df["Strength"] == -1])
@@ -165,7 +166,6 @@ def live_dashboard():
                 
         st.divider()
         
-        # ---------------- Shares Data Table ----------------
         st.markdown("### 📊 Sabhi Shares ki Live Condition")
         
         display_df = df.drop(columns=["Strength"]).copy()
@@ -180,4 +180,3 @@ def live_dashboard():
         )
         
 live_dashboard()
-    
