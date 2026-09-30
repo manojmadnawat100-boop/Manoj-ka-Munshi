@@ -141,27 +141,51 @@ buy_pe_price = round(RobustBlack76.price(future_price, buy_hedge_pe, dte_y, r_ra
 
 
 # =====================================================================
-# 5. EXECUTION SECTOR: SETS SELECTOR (1 to 10 Sets)
+# 5. EXECUTION SECTOR: SETS SELECTOR & REQUIRED MARGIN CALCULATOR
 # =====================================================================
 st.divider()
-st.subheader("📦 Select Strategy Sets Before Execution")
+st.subheader("📦 Strategy Sets & Margin Requirement")
 
-sets_col1, sets_col2 = st.columns([1, 2])
+sets_col1, sets_col2, sets_col3 = st.columns([1, 1.5, 1.5])
 with sets_col1:
     strategy_sets = st.selectbox(
-        "Kitne Sets Trade Karne Hain? (1 Set = 1 Lot Sell + 2 Lots Buy)",
+        "Trade Sets (1-10)",
         options=list(range(1, 11)),
         index=0
-    )
-with sets_col2:
-    st.info(
-        f"**Order Breakdown for {strategy_sets} Set(s):**\n"
-        f"• **Buy Leg (Margin Hedge):** {strategy_sets * 2} Lots = **{strategy_sets * 2 * lot_size} Qty** (CE & PE)\n"
-        f"• **Sell Leg (Short):** {strategy_sets * 1} Lot = **{strategy_sets * 1 * lot_size} Qty** (CE & PE)"
     )
 
 sell_qty = int(strategy_sets * 1 * lot_size)
 buy_qty = int(strategy_sets * 2 * lot_size)
+
+# Premium calculations
+buy_premium_total = (buy_ce_price + buy_pe_price) * buy_qty
+sell_premium_total = (sell_ce_price + sell_pe_price) * sell_qty
+net_cash_flow = sell_premium_total - buy_premium_total
+
+# --- NSE SPAN + Exposure Margin Calculation ---
+# Naked Straddle/Strangle margin ≈ ₹1,40,000 per lot
+# OTM Hedge buy hone ke baad hedged span margin ≈ (Spread Width * Lot Size) + Buffer
+spread_width = hedge_offset # 200 points
+max_spread_risk = spread_width * lot_size # ₹15,000 per lot (at 75 lot size)
+base_span_exposure_per_set = max(35000.0, max_spread_risk * 1.5) # ₹35,000 approx hedged SPAN per set
+
+total_hedged_span_margin = base_span_exposure_per_set * strategy_sets
+total_required_capital = total_hedged_span_margin + buy_premium_total
+
+with sets_col2:
+    st.info(
+        f"**Order Breakdown ({strategy_sets} Set):**\n"
+        f"• **Buy Leg:** {strategy_sets * 2} Lots = **{buy_qty} Qty** (CE & PE)\n"
+        f"• **Sell Leg:** {strategy_sets * 1} Lot = **{sell_qty} Qty** (CE & PE)"
+    )
+
+with sets_col3:
+    st.success(
+        f"**💰 Margin & Capital Needed:**\n"
+        f"• **Approx SPAN Margin:** ₹{total_hedged_span_margin:,.2f}\n"
+        f"• **Premium to Buy:** ₹{buy_premium_total:,.2f}\n"
+        f"• **👉 Total Required Balance:** **₹{total_required_capital:,.2f}**"
+    )
 
 # Greeks & Risk calculations
 d_sell_ce = RobustBlack76.delta(future_price, selected_sell_ce, dte_y, r_rate, est_iv, "CE")
@@ -176,14 +200,14 @@ options_net_delta = (
     (buy_qty * d_buy_pe)
 )
 total_net_delta = options_net_delta + float(st.session_state.hedge_position)
-net_cash_flow = (sell_qty * (sell_ce_price + sell_pe_price)) - (buy_qty * (buy_ce_price + buy_pe_price))
 
-# Metrics Row
+# Top KPIs Row
+st.divider()
 k1, k2, k3, k4 = st.columns(4)
-k1.metric("Strategy PoP", f"{selected_pop:.1f} %", "Minimum 80% Filter")
+k1.metric("Strategy PoP", f"{selected_pop:.1f} %", "Min 80% Filter")
 k2.metric("Safe Expiry Range", f"{selected_sell_pe} - {selected_sell_ce}", f"Spread: {selected_sell_ce - selected_sell_pe} pts")
 k3.metric("Net Delta Exposure", f"{total_net_delta:.2f}", f"Tolerance: ±{delta_threshold * lot_size:.1f}")
-k4.metric("Net Inflow / Premium", f"₹{net_cash_flow:,.2f}", f"{strategy_sets} Set(s) Selected")
+k4.metric("Net Inflow / Premium", f"₹{net_cash_flow:,.2f}", f"Balance Req: ₹{total_required_capital:,.0f}")
 
 # Breakdown Table
 st.subheader("🎯 Active Setup Breakdown")
@@ -200,7 +224,7 @@ st.dataframe(pd.DataFrame(breakdown_records), use_container_width=True)
 # =====================================================================
 # 6. EXECUTION TERMINAL (STRICT ORDER SEQUENCING)
 # =====================================================================
-st.subheader("🖥️️ Execution Terminal")
+st.subheader("🖥 Execution Terminal")
 t_col1, t_col2 = st.columns([2, 1])
 
 with t_col1:
@@ -217,7 +241,7 @@ with t_col1:
         st.success("✅ **DELTA NEUTRAL:** Portfolio safe range me hai.")
 
 with t_col2:
-    st.write("**One-Click Order Actions**")
+    st.write(f"**Execute Orders (Req: ₹{total_required_capital:,.0f})**")
     btn1, btn2 = st.columns(2)
     
     with btn1:
@@ -230,7 +254,7 @@ with t_col2:
             log_order(f"{selected_sell_ce}CE", "SELL (ENTRY)", sell_qty, sell_ce_price)
             log_order(f"{selected_sell_pe}PE", "SELL (ENTRY)", sell_qty, sell_pe_price)
             
-            st.success(f"Execution Successful! {strategy_sets} Sets place ho gaye.")
+            st.success(f"Executed: {strategy_sets} Sets place ho gaye! Pehle BUY fir SELL.")
             st.rerun()
             
     with btn2:
@@ -252,4 +276,4 @@ if st.session_state.order_book:
     st.dataframe(pd.DataFrame(st.session_state.order_book), use_container_width=True)
 else:
     st.caption("Filhal koi active order placed nahi hua hai.")
-    
+            
