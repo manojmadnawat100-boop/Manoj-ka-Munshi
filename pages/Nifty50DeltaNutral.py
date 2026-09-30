@@ -118,7 +118,6 @@ if "daily_realized_loss" not in st.session_state:
     st.session_state.daily_realized_loss = 0.0
 
 def execute_upstox_order(instrument_key: str, symbol: str, side: str, qty: int, price: float, access_token: str, mode: str) -> Tuple[bool, str]:
-    """Upstox API v2 se live order bhejta hai aur verified success/failure status deta hai."""
     status = "PAPER_FILLED"
     order_id = "SIM_" + datetime.now().strftime("%f")[:5]
     success = True
@@ -130,11 +129,13 @@ def execute_upstox_order(instrument_key: str, symbol: str, side: str, qty: int, 
             api_client = upstox_client.ApiClient(config)
             order_api = upstox_client.OrderApi(api_client)
 
+            tick_price = round(round(price / 0.05) * 0.05, 2)
+
             order_payload = upstox_client.PlaceOrderRequest(
                 quantity=qty,
                 product="I",
                 validity="DAY",
-                price=float(price),
+                price=float(tick_price),
                 tag="SafeInstiAlgo",
                 instrument_token=instrument_key,
                 order_type="LIMIT",
@@ -177,13 +178,13 @@ with st.sidebar:
 
     st.divider()
     st.header("🛡️ Capital Protection Shields")
-    # Rule 1: Daily Account Max Loss
-    daily_account_loss_limit = st.number_input("Daily Max Loss Circuit (₹)", min_value=1000, max_value=50000, value=5000, step=500,
-                                               help="Pura din ka loss is level par pahunchne par trading automatic lock ho jayegi.")
-    
-    # Rule 2: 9:15 to 9:30 AM Market Opening Filter
-    enforce_opening_filter = st.checkbox("Enforce 9:15-9:30 AM Whipsaw Lock", value=True,
-                                        help="Subah 9:30 AM se pehle wide spreads aur spikes se bachne ke liye execution band rakhega.")
+    daily_account_loss_limit = st.number_input("Daily Max Loss Circuit (₹)", min_value=1000, max_value=50000, value=5000, step=500)
+    enforce_opening_filter = st.checkbox("Enforce 9:15-9:30 AM Whipsaw Lock", value=True)
+
+    if st.button("🔄 Reset Daily Loss Counter"):
+        st.session_state.daily_realized_loss = 0.0
+        st.success("Daily realized loss reset ho gaya!")
+        st.rerun()
 
     st.divider()
     st.header("🏛 FII / DII Footprint Feeds")
@@ -221,16 +222,14 @@ est_iv = (india_vix + 1.0) / 100.0
 # =====================================================================
 st.title("⚡ Institutional Nifty Terminal (Protected Execution)")
 
-# Check if Daily Account Loss Limit is breached
 if abs(st.session_state.daily_realized_loss) >= daily_account_loss_limit:
-    st.error(f"🛑 **ACCOUNT LOCKED: Daily Max Loss (₹{daily_account_loss_limit:,.2f}) Reach Ho Chuka Hai!** Naye orders lena band kar diya gaya hai.")
+    st.error(f"🛑 **ACCOUNT LOCKED: Daily Max Loss (₹{daily_account_loss_limit:,.2f}) Reach Ho Chuka Hai!** Naye orders lena band hai.")
     st.stop()
 
 future_price = st.number_input("Nifty Future LTP", min_value=15000.0, max_value=35000.0, value=24800.0, step=5.0)
 strike_step = 50
 atm_strike = int(round(future_price / strike_step) * strike_step)
 
-# PCR & Max Pain
 pcr_value = InstitutionalEngine.calculate_pcr(total_put_oi, total_call_oi)
 pain_strikes = [atm_strike - 200, atm_strike - 100, atm_strike, atm_strike + 100, atm_strike + 200]
 call_oi_sim = [1500000, 3500000, 6500000, 4000000, 2000000]
@@ -238,7 +237,6 @@ put_oi_sim = [2500000, 5000000, 6000000, 2000000, 800000]
 max_pain = InstitutionalEngine.calculate_max_pain(pain_strikes, call_oi_sim, put_oi_sim)
 vix_info = InstitutionalEngine.vix_analysis(india_vix)
 
-# Strike Scanner for 80%+ PoP
 selected_sell_ce = None
 selected_sell_pe = None
 selected_pop = 0.0
@@ -262,7 +260,6 @@ hedge_offset = 200
 buy_hedge_ce = selected_sell_ce + hedge_offset
 buy_hedge_pe = selected_sell_pe - hedge_offset
 
-# Prices via Black-76
 sell_ce_price = round(RobustBlack76.price(future_price, selected_sell_ce, dte_y, r_rate, est_iv, "CE"), 2)
 sell_pe_price = round(RobustBlack76.price(future_price, selected_sell_pe, dte_y, r_rate, est_iv, "PE"), 2)
 buy_ce_price = round(RobustBlack76.price(future_price, buy_hedge_ce, dte_y, r_rate, est_iv, "CE"), 2)
@@ -391,40 +388,34 @@ exit_reason = ""
 if st.session_state.strategy_active:
     now_time = datetime.now().time()
     
-    # 1. Pre-Gamma Blast Threshold
     if abs(net_portfolio_gamma) >= (0.35 * strategy_sets):
         auto_exit_triggered = True
         exit_reason = f"🚨 PRE-GAMMA BLAST DETECTED! Net Gamma ({net_portfolio_gamma:.4f}) breached safety limits."
 
-    # 2. Hard Max Loss
     elif current_pnl <= -total_max_loss_limit:
         auto_exit_triggered = True
         exit_reason = f"HARD MAX LOSS HIT (-₹{abs(current_pnl):,.2f})"
 
-    # 3. Target Profit
     elif current_pnl >= total_target_profit:
         auto_exit_triggered = True
         exit_reason = f"TARGET PROFIT ACHIEVED (+₹{current_pnl:,.2f})"
 
-    # 4. Trailing SL Hit
     elif st.session_state.peak_pnl >= (trail_trigger * strategy_sets):
         allowed_pullback = 0.4 * st.session_state.peak_pnl
         if current_pnl <= (st.session_state.peak_pnl - allowed_pullback):
             auto_exit_triggered = True
             exit_reason = f"TRAILING SL HIT (Secured: ₹{current_pnl:,.2f})"
 
-    # 5. 3:10 PM Rule
     elif now_time >= auto_exit_time:
         auto_exit_triggered = True
         exit_reason = f"TIME LIMIT REACHED ({now_time.strftime('%H:%M')} >= {auto_exit_time.strftime('%H:%M')})"
 
     if auto_exit_triggered:
-        execute_upstox_order("INST_CE", f"{selected_sell_ce} CE", "CIRCUIT_BUY (COVER SHORT)", sell_qty, sell_ce_price, access_token, trading_mode)
-        execute_upstox_order("INST_PE", f"{selected_sell_pe} PE", "CIRCUIT_BUY (COVER SHORT)", sell_qty, sell_pe_price, access_token, trading_mode)
-        execute_upstox_order("INST_CE_H", f"{buy_hedge_ce} CE", "CIRCUIT_SELL (CLOSE HEDGE)", buy_qty, buy_ce_price, access_token, trading_mode)
-        execute_upstox_order("INST_PE_H", f"{buy_hedge_pe} PE", "CIRCUIT_SELL (CLOSE HEDGE)", buy_qty, buy_pe_price, access_token, trading_mode)
+        execute_upstox_order(f"NSE_FO|{selected_sell_ce}_CE", f"{selected_sell_ce} CE", "CIRCUIT_BUY (COVER SHORT)", sell_qty, sell_ce_price, access_token, trading_mode)
+        execute_upstox_order(f"NSE_FO|{selected_sell_pe}_PE", f"{selected_sell_pe} PE", "CIRCUIT_BUY (COVER SHORT)", sell_qty, sell_pe_price, access_token, trading_mode)
+        execute_upstox_order(f"NSE_FO|{buy_hedge_ce}_CE", f"{buy_hedge_ce} CE", "CIRCUIT_SELL (CLOSE HEDGE)", buy_qty, buy_ce_price, access_token, trading_mode)
+        execute_upstox_order(f"NSE_FO|{buy_hedge_pe}_PE", f"{buy_hedge_pe} PE", "CIRCUIT_SELL (CLOSE HEDGE)", buy_qty, buy_pe_price, access_token, trading_mode)
         
-        # Track realized daily loss
         if current_pnl < 0:
             st.session_state.daily_realized_loss += current_pnl
 
@@ -434,17 +425,16 @@ if st.session_state.strategy_active:
 
 
 # =====================================================================
-# 10. EXECUTION TERMINAL (WITH REJECTION & OPENING TIME SHIELDS)
+# 10. PROTECTED EXECUTION TERMINAL & ORDER ROUTING
 # =====================================================================
 st.subheader("🖥 Protected Upstox Order Terminal")
 t_col1, t_col2 = st.columns([1.5, 1])
 
-inst_buy_ce = f"NSE_FO|NIFTY_{buy_hedge_ce}_CE"
-inst_buy_pe = f"NSE_FO|NIFTY_{buy_hedge_pe}_PE"
-inst_sell_ce = f"NSE_FO|NIFTY_{selected_sell_ce}_CE"
-inst_sell_pe = f"NSE_FO|NIFTY_{selected_sell_pe}_PE"
+inst_buy_ce = f"NSE_FO|{buy_hedge_ce}_CE"
+inst_buy_pe = f"NSE_FO|{buy_hedge_pe}_PE"
+inst_sell_ce = f"NSE_FO|{selected_sell_ce}_CE"
+inst_sell_pe = f"NSE_FO|{selected_sell_pe}_PE"
 
-# Market Opening Time Filter Check
 current_clock = datetime.now().time()
 is_opening_whipsaw_time = time(9, 15) <= current_clock < time(9, 30)
 
@@ -456,14 +446,13 @@ with t_col2:
         execute_disabled = st.session_state.strategy_active or (enforce_opening_filter and is_opening_whipsaw_time)
         if st.button(f"🟢 Execute {strategy_sets} Sets", use_container_width=True, disabled=execute_disabled):
             
-            # STEP 1: Pehle BUY hedge execute hoga
+            # STEP 1: Pehle BUY hedge order execute hoga
             ok_buy_ce, _ = execute_upstox_order(inst_buy_ce, f"{buy_hedge_ce} CE", "BUY (ENTRY)", buy_qty, buy_ce_price, access_token, trading_mode)
             ok_buy_pe, _ = execute_upstox_order(inst_buy_pe, f"{buy_hedge_pe} PE", "BUY (ENTRY)", buy_qty, buy_pe_price, access_token, trading_mode)
 
-            # FALLBACK SHIELD: Agar Buy orders kisi wajah se fail hue toh Sell execute nahi hoga!
+            # FALLBACK SHIELD: Agar Buy fail hua toh Sell execute nahi hoga!
             if not (ok_buy_ce and ok_buy_pe):
-                st.error("🚨 HEDGE BUY REJECTED BY BROKER: Margin Shortage ya API Error. Sell legs cancel kar di gayi hain!")
-                # Reversal if one was filled
+                st.error("🚨 HEDGE BUY REJECTED BY BROKER: Margin Shortage ya API Error. Short sell legs cancel kar di gayi hain!")
                 execute_upstox_order(inst_buy_ce, f"{buy_hedge_ce} CE", "CANCEL_EXIT", buy_qty, buy_ce_price, access_token, trading_mode)
                 execute_upstox_order(inst_buy_pe, f"{buy_hedge_pe} PE", "CANCEL_EXIT", buy_qty, buy_pe_price, access_token, trading_mode)
             else:
@@ -483,11 +472,11 @@ with t_col2:
 
     with btn2:
         if st.button(f"🔴 Exit {strategy_sets} Sets", use_container_width=True, disabled=not st.session_state.strategy_active):
-            # STEP 1: Pehle SELL leg buy-back hokar close hogi taaki naked risk na rahe
+            # STEP 1: Pehle SELL leg close hogi
             execute_upstox_order(inst_sell_ce, f"{selected_sell_ce} CE", "BUY (EXIT SHORT)", sell_qty, sell_ce_price, access_token, trading_mode)
             execute_upstox_order(inst_sell_pe, f"{selected_sell_pe} PE", "BUY (EXIT SHORT)", sell_qty, sell_pe_price, access_token, trading_mode)
 
-            # STEP 2: Baad me BUY hedge positions exit hongi
+            # STEP 2: Phir BUY hedge leg close hogi
             execute_upstox_order(inst_buy_ce, f"{buy_hedge_ce} CE", "SELL (EXIT HEDGE)", buy_qty, buy_ce_price, access_token, trading_mode)
             execute_upstox_order(inst_buy_pe, f"{buy_hedge_pe} PE", "SELL (EXIT HEDGE)", buy_qty, buy_pe_price, access_token, trading_mode)
 
