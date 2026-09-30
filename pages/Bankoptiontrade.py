@@ -14,26 +14,6 @@ st.set_page_config(
 
 st.title("🏦 Institutional Bank Nifty Trend, Depth & Regime Engine")
 
-# ---------------- Custom CSS for Buttons ----------------
-st.markdown("""
-<style>
-div[data-testid="stButton"] > button[kind="primary"] {
-    background-color: #00c853 !important;
-    color: white !important;
-    border: none !important;
-    font-weight: bold;
-    width: 100%;
-}
-div[data-testid="stButton"] > button[kind="secondary"] {
-    background-color: #d50000 !important;
-    color: white !important;
-    border: none !important;
-    font-weight: bold;
-    width: 100%;
-}
-</style>
-""", unsafe_allow_html=True)
-
 # ---------------- Secrets & Endpoints ----------------
 TOKEN = st.secrets.get("UPSTOX_TOKEN", "")
 TG_TOKEN = st.secrets.get("TELEGRAM_TOKEN", "")
@@ -72,6 +52,10 @@ if "last_alert_time" not in st.session_state:
     st.session_state.last_alert_time = 0
 if "open_positions" not in st.session_state:
     st.session_state.open_positions = []
+if "selected_action" not in st.session_state:
+    st.session_state.selected_action = "BUY"
+if "selected_opt_type" not in st.session_state:
+    st.session_state.selected_opt_type = "CALL (CE)"
 
 # ---------------- Helper Functions ----------------
 def send_telegram_alert(msg: str):
@@ -370,74 +354,84 @@ def render_dashboard():
 
     st.divider()
 
-    # ---------------- Order Execution & Lot Selection ----------------
-    st.subheader("⚡ Quick Trade Execution Panel")
+    # ---------------- Dynamic Order Execution Panel ----------------
+    st.subheader("⚡ Simple Execution Panel")
+
+    col_lots, col_type, col_action = st.columns([1.2, 1.8, 1.8])
     
-    col_lot, col_ce_buy, col_ce_sell, col_pe_buy, col_pe_sell = st.columns([1.5, 2, 2, 2, 2])
-    
-    with col_lot:
-        lots = st.selectbox("Lots (1 Lot = 15 Qty)", options=list(range(1, 11)), index=0)
+    with col_lots:
+        lots = st.selectbox("Lots (1 Lot = 15)", options=list(range(1, 11)), index=0)
         total_qty = lots * LOT_SIZE
-        st.caption(f"Total Quantity: **{total_qty}**")
+        st.caption(f"Quantity: **{total_qty}**")
 
-    # Order action buttons
-    with col_ce_buy:
-        if st.button(f"🟢 Buy CALL (CE)\n[{lots} Lot]", key="btn_buy_ce", type="primary"):
-            trade = {
-                "id": len(st.session_state.open_positions) + 1,
-                "type": "BUY CE",
-                "lots": lots,
-                "qty": total_qty,
-                "entry_spot": spot_price,
-                "time": ist_time
-            }
-            st.session_state.open_positions.append(trade)
-            st.toast(f"✅ Order Placed: BUY CE {lots} Lot ({total_qty} Qty)")
+    with col_type:
+        opt_type = st.radio(
+            "1. Option Type Chunein:",
+            options=["CALL (CE)", "PUT (PE)"],
+            horizontal=True,
+            key="radio_opt_type"
+        )
 
-    with col_ce_sell:
-        if st.button(f"🔴 Sell CALL (CE)\n[{lots} Lot]", key="btn_sell_ce", type="secondary"):
-            trade = {
-                "id": len(st.session_state.open_positions) + 1,
-                "type": "SELL CE",
-                "lots": lots,
-                "qty": total_qty,
-                "entry_spot": spot_price,
-                "time": ist_time
-            }
-            st.session_state.open_positions.append(trade)
-            st.toast(f"✅ Order Placed: SELL CE {lots} Lot ({total_qty} Qty)")
+    with col_action:
+        action = st.radio(
+            "2. Action Chunein:",
+            options=["BUY", "SELL"],
+            horizontal=True,
+            key="radio_action"
+        )
 
-    with col_pe_buy:
-        if st.button(f"🔴 Buy PUT (PE)\n[{lots} Lot]", key="btn_buy_pe", type="secondary"):
-            trade = {
-                "id": len(st.session_state.open_positions) + 1,
-                "type": "BUY PE",
-                "lots": lots,
-                "qty": total_qty,
-                "entry_spot": spot_price,
-                "time": ist_time
-            }
-            st.session_state.open_positions.append(trade)
-            st.toast(f"✅ Order Placed: BUY PE {lots} Lot ({total_qty} Qty)")
+    # Dynamic CSS Inject based on Action (BUY = Green, SELL = Red)
+    if action == "BUY":
+        btn_bg = "#00c853"
+        btn_hover = "#00a844"
+        text_color = "#ffffff"
+    else:
+        btn_bg = "#d50000"
+        btn_hover = "#b70000"
+        text_color = "#ffffff"
 
-    with col_pe_sell:
-        if st.button(f"🟢 Sell PUT (PE)\n[{lots} Lot]", key="btn_sell_pe", type="primary"):
-            trade = {
-                "id": len(st.session_state.open_positions) + 1,
-                "type": "SELL PE",
-                "lots": lots,
-                "qty": total_qty,
-                "entry_spot": spot_price,
-                "time": ist_time
-            }
-            st.session_state.open_positions.append(trade)
-            st.toast(f"✅ Order Placed: SELL PE {lots} Lot ({total_qty} Qty)")
+    st.markdown(f"""
+    <style>
+    div[data-testid="stRadio"] > div {{
+        gap: 12px;
+    }}
+    div.st-key-execute_order_btn button {{
+        background-color: {btn_bg} !important;
+        color: {text_color} !important;
+        border: 2px solid {btn_bg} !important;
+        font-size: 1.15rem !important;
+        font-weight: 700 !important;
+        height: 52px !important;
+        border-radius: 8px !important;
+        width: 100% !important;
+        transition: 0.2s ease-in-out !important;
+    }}
+    div.st-key-execute_order_btn button:hover {{
+        background-color: {btn_hover} !important;
+        border-color: {btn_hover} !important;
+        transform: translateY(-1px);
+    }}
+    </style>
+    """, unsafe_allow_html=True)
+
+    # Single Big Action Execution Button
+    btn_label = f"🚀 Execute {action} {opt_type} ({lots} Lot / {total_qty} Qty)"
+    if st.button(btn_label, key="execute_order_btn"):
+        order_entry = {
+            "id": len(st.session_state.open_positions) + 1,
+            "type": f"{action} {opt_type}",
+            "lots": lots,
+            "qty": total_qty,
+            "entry_spot": spot_price,
+            "time": ist_time
+        }
+        st.session_state.open_positions.append(order_entry)
+        st.toast(f"✅ Success: {action} {opt_type} for {lots} Lot ({total_qty} Qty) Placed!")
 
     # ---------------- Active Positions Section ----------------
     st.markdown("### 📊 Active Positions")
     if st.session_state.open_positions:
         pos_df = pd.DataFrame(st.session_state.open_positions)
-        
         st.dataframe(pos_df, use_container_width=True, hide_index=True)
         
         if st.button("🗑️ Square Off / Clear All Positions"):
@@ -462,4 +456,4 @@ def render_dashboard():
     )
 
 render_dashboard()
-      
+    
