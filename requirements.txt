@@ -3,3 +3,5 @@ pandas
 requests
 numpy
 scipy
+upstox-python-sdk
+requests
