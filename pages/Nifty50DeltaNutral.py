@@ -1,14 +1,23 @@
 import math
 import numpy as np
+import streamlit as st
 from scipy.stats import norm
 from scipy.optimize import brentq
 from dataclasses import dataclass
-from typing import Dict, Optional
-import logging
+from typing import Dict
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# =====================================================================
+# STREAMLIT PAGE CONFIG
+# =====================================================================
+st.set_page_config(
+    page_title="Nifty Delta Neutral Engine",
+    page_icon="⚡",
+    layout="wide"
+)
 
-
+# =====================================================================
+# 1. QUANTITATIVE PRICING & GREEKS ENGINE (Black-76 for Index)
+# =====================================================================
 class RobustBlack76:
     @staticmethod
     def calc_d1_d2(F: float, K: float, T: float, sigma: float):
@@ -37,7 +46,6 @@ class RobustBlack76:
         df = math.exp(-r * T)
         intrinsic = max(0.0, (F - K) if option_type.upper() == "CE" else (K - F)) * df
         
-        # आर्बिट्राज/डर्टी टिक प्रोटेक्शन
         if ltp <= intrinsic:
             return max(0.05, fallback_iv)
 
@@ -45,15 +53,13 @@ class RobustBlack76:
             return cls.price(F, K, T, r, sigma, option_type) - ltp
 
         try:
-            # ब्रॉड बाउंड्स [1%, 400%]
-            return brentq(objective, 0.01, 4.0, maxiter=80, xtol=1e-4)
+            return brentq(objective, 0.01, 3.5, maxiter=80, xtol=1e-4)
         except (ValueError, RuntimeError):
-            return fallback_iv  # पिछले लेग का IV इस्तेमाल करें
+            return fallback_iv
 
     @classmethod
     def delta(cls, F: float, K: float, T: float, r: float, sigma: float, option_type: str) -> float:
         if T <= 1e-5 or sigma <= 1e-4:
-            # एक्सपायरी पर बाइनरी डेल्टा
             if option_type.upper() == "CE":
                 return 1.0 if F > K else 0.0
             else:
@@ -63,137 +69,129 @@ class RobustBlack76:
         return (df * norm.cdf(d1)) if option_type.upper() == "CE" else (-df * norm.cdf(-d1))
 
 
+# =====================================================================
+# 2. DATA MODELS & ENGINE
+# =====================================================================
 @dataclass
 class PositionLeg:
     symbol: str
     strike: float
-    option_type: str       # 'CE', 'PE'
-    expiry_years: float    # T = DTE / 365.25
-    quantity: int          # +ve for Buy, -ve for Sell
+    option_type: str
+    quantity: int
     entry_price: float
     current_iv: float = 0.16
     current_delta: float = 0.0
 
 
-class InstitutionalDeltaEngine:
-    def __init__(
-        self,
-        lot_size: int = 75,
-        risk_free_rate: float = 0.065,
-        delta_band_lots: float = 0.5,     # 0.5 लॉट से ज्यादा डेल्टा ड्रिफ्ट होने पर हेज
-        max_drawdown_limit: float = 50000.0,
-        exchange_freeze_qty: int = 1800   # NSE Slice Limit
-    ):
+class DeltaEngine:
+    def __init__(self, lot_size: int, delta_band_lots: float, risk_free_rate: float = 0.065):
         self.lot_size = lot_size
-        self.r = risk_free_rate
         self.delta_band = delta_band_lots * lot_size
-        self.max_dd = max_drawdown_limit
-        self.freeze_limit = exchange_freeze_qty
+        self.r = risk_free_rate
 
-        self.legs: Dict[str, PositionLeg] = {}
-        self.futures_hedge_qty: int = 0
-        self.is_halted: bool = False
-
-    def register_leg(self, leg: PositionLeg):
-        self.legs[leg.symbol] = leg
-        logging.info(f"Registered Leg: {leg.symbol} | Qty: {leg.quantity} | Strike: {leg.strike}")
-
-    def sync_tick(self, future_ltp: float, ticks: Dict[str, float]) -> float:
-        """
-        लाइव टिक्स प्रोसेस करता है और पोर्टफोलियो ग्रीक्स व पीएनएल अपडेट करता है।
-        """
-        if self.is_halted:
-            logging.error("Execution Engine HALTED due to Risk Trigger.")
-            return 0.0
-
-        net_delta = float(self.futures_hedge_qty)  # फ्यूचर का डेल्टा 1.0
+    def calculate_state(self, legs: list, future_ltp: float, ticks: Dict[str, float], dte_years: float, hedge_qty: int):
+        total_delta = float(hedge_qty)
         total_pnl = 0.0
+        leg_metrics = []
 
-        for symbol, leg in self.legs.items():
-            ltp = ticks.get(symbol, leg.entry_price)
-            total_pnl += (ltp - leg.entry_price) * leg.quantity
+        for leg in legs:
+            ltp = ticks.get(leg.symbol, leg.entry_price)
+            pnl = (ltp - leg.entry_price) * leg.quantity
+            total_pnl += pnl
 
-            # 1. डायनामिक IV कैलकुलेशन (विथ फॉलबैक)
-            leg.current_iv = RobustBlack76.implied_volatility(
-                ltp=ltp, F=future_ltp, K=leg.strike, T=leg.expiry_years,
+            iv = RobustBlack76.implied_volatility(
+                ltp=ltp, F=future_ltp, K=leg.strike, T=dte_years,
                 r=self.r, option_type=leg.option_type, fallback_iv=leg.current_iv
             )
-
-            # 2. सटीक डेल्टा कैलकुलेशन
             unit_delta = RobustBlack76.delta(
-                F=future_ltp, K=leg.strike, T=leg.expiry_years,
-                r=self.r, sigma=leg.current_iv, option_type=leg.option_type
+                F=future_ltp, K=leg.strike, T=dte_years,
+                r=self.r, sigma=iv, option_type=leg.option_type
             )
-            leg.current_delta = unit_delta
-            net_delta += unit_delta * leg.quantity
+            leg_delta = unit_delta * leg.quantity
+            total_delta += leg_delta
 
-        # रिस्क चेक (ड्रॉडाउन सर्किट ब्रेकर)
-        if total_pnl <= -self.max_dd:
-            self._emergency_kill_switch(total_pnl)
-            return 0.0
+            leg_metrics.append({
+                "Symbol": leg.symbol,
+                "Type": leg.option_type,
+                "Qty": leg.quantity,
+                "Entry": leg.entry_price,
+                "LTP": ltp,
+                "IV (%)": round(iv * 100, 2),
+                "Unit Delta": round(unit_delta, 3),
+                "Position Delta": round(leg_delta, 2),
+                "PnL (₹)": round(pnl, 2)
+            })
 
-        # डेल्टा बैंड वायलेशन चेक
-        self._check_and_hedge(net_delta, future_ltp)
-        return net_delta
-
-    def _check_and_hedge(self, net_delta: float, current_future_price: float):
-        """
-        बैंड-बेस्ड हिस्टेरेसिस हेजिंग और स्लाइसिंग इंजन।
-        """
-        if abs(net_delta) > self.delta_band:
-            # नियरेस्ट लॉट साइज में राउंडिंग
-            needed_hedge = -int(round(net_delta / self.lot_size) * self.lot_size)
-            
-            if needed_hedge != 0:
-                self._route_smart_order(needed_hedge, current_future_price)
-
-    def _route_smart_order(self, total_qty: int, price: float):
-        side = "BUY" if total_qty > 0 else "SELL"
-        remaining = abs(total_qty)
-
-        logging.warning(f"--- HEDGE TRIGGERED: {side} {remaining} NIFTY FUTURES @ ~{price:.2f} ---")
-
-        # NSE Freeze Limit Slicing
-        while remaining > 0:
-            slice_qty = min(remaining, self.freeze_limit)
-            self._execute_sliced_limit_order(side, slice_qty, price)
-            remaining -= slice_qty
-
-        self.futures_hedge_qty += total_qty
-        logging.info(f"Hedge Complete. New Net Futures Position: {self.futures_hedge_qty}")
-
-    def _execute_sliced_limit_order(self, side: str, qty: int, benchmark_price: float):
-        # प्रोडक्शन में यहाँ Broker API (जैसे KiteConnect.place_order) कॉल होगी
-        logging.info(f"Executed Order Slice: {side} {qty} Qty with Limit IOC at {benchmark_price:.2f}")
-
-    def _emergency_kill_switch(self, pnl: float):
-        self.is_halted = True
-        logging.critical(f"CIRCUIT BREAKER HIT: PnL reached ₹{pnl:.2f}. Canceling all orders and squaring off!")
+        return total_delta, total_pnl, leg_metrics
 
 
 # =====================================================================
-# VERIFICATION HARNESS
+# 3. STREAMLIT USER INTERFACE
 # =====================================================================
-if __name__ == "__main__":
-    nifty_fut = 24800.0
-    dte = 3 / 365.25  # 3 दिन एक्सपायरी
-    lot = 75
+st.title("🛡️ Institutional Delta-Neutral Risk Engine")
+st.caption("Black-76 Dynamic Hedging & Real-Time Portfolio Greek Engine for Nifty 50")
 
-    engine = InstitutionalDeltaEngine(lot_size=lot, delta_band_lots=0.5, max_drawdown_limit=40000)
+# Sidebar Configurations
+with st.sidebar:
+    st.header("⚙️ Parameters")
+    lot_size = st.number_input("Nifty Lot Size", min_value=25, max_value=100, value=75, step=25)
+    delta_threshold = st.slider("Delta Rebalance Tolerance (in Lots)", 0.1, 2.0, 0.5, 0.1)
+    r_rate = st.number_input("Risk-Free Rate (RBI Proxy)", min_value=0.01, max_value=0.15, value=0.065, step=0.005)
+    days_to_expiry = st.slider("Days to Expiry (DTE)", 0.0, 30.0, 3.5, 0.5)
 
-    # Short Straddle: 24800 CE & PE (150-150 Qty)
-    ce = PositionLeg("NIFTY24800CE", 24800, "CE", dte, -150, entry_price=120.0)
-    pe = PositionLeg("NIFTY24800PE", 24800, "PE", dte, -150, entry_price=118.0)
-    engine.register_leg(ce)
-    engine.register_leg(pe)
+# Main Inputs
+col1, col2, col3 = st.columns(3)
+with col1:
+    future_price = st.number_input("Nifty Future LTP", min_value=15000.0, max_value=35000.0, value=24800.0, step=10.0)
+with col2:
+    strike_selected = st.number_input("ATM Strike", min_value=15000, max_value=35000, value=24800, step=50)
+with col3:
+    existing_hedge = st.number_input("Existing Futures Hedged Qty", value=0, step=int(lot_size))
 
-    # टिक 1: स्टेबल
-    ticks_normal = {"NIFTY24800CE": 120.0, "NIFTY24800PE": 118.0}
-    d1 = engine.sync_tick(nifty_fut, ticks_normal)
-    print(f"Tick 1 Net Delta: {d1:.2f}")
+# Market Prices for ATM Straddle
+st.subheader("📊 Market Feed (LTP Input)")
+m_col1, m_col2 = st.columns(2)
+with m_col1:
+    ce_ltp = st.number_input(f"NIFTY {strike_selected} CE Price", min_value=0.5, value=125.0, step=0.5)
+with m_col2:
+    pe_ltp = st.number_input(f"NIFTY {strike_selected} PE Price", min_value=0.5, value=120.0, step=0.5)
 
-    # टिक 2: 120 पॉइंट्स का मार्केट गैप-अप
-    ticks_spiked = {"NIFTY24800CE": 195.0, "NIFTY24800PE": 55.0}
-    d2 = engine.sync_tick(nifty_fut + 120, ticks_spiked)
-    print(f"Tick 2 Net Delta (Post-Rebalance Trigger): {d2:.2f}")
-      
+# Setup Positions (2 Lots Short Straddle)
+legs = [
+    PositionLeg(f"NIFTY{strike_selected}CE", strike_selected, "CE", -int(lot_size * 2), 125.0),
+    PositionLeg(f"NIFTY{strike_selected}PE", strike_selected, "PE", -int(lot_size * 2), 120.0)
+]
+
+ticks = {
+    f"NIFTY{strike_selected}CE": ce_ltp,
+    f"NIFTY{strike_selected}PE": pe_ltp
+}
+
+# Run Engine
+engine = DeltaEngine(lot_size=lot_size, delta_band_lots=delta_threshold, risk_free_rate=r_rate)
+dte_y = max(days_to_expiry / 365.25, 1e-5)
+net_delta, net_pnl, metrics = engine.calculate_state(legs, future_price, ticks, dte_y, existing_hedge)
+
+# Status & KPI Metrics
+st.divider()
+kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+kpi1.metric("Net Portfolio Delta", f"{net_delta:.2f}")
+kpi2.metric("Tolerance Limit", f"±{delta_threshold * lot_size:.1f}")
+kpi3.metric("Net Unrealized PnL", f"₹{net_pnl:,.2f}")
+hedge_needed = -int(round(net_delta / lot_size) * lot_size)
+kpi4.metric("Futures Rebalance Required", f"{hedge_needed} Qty")
+
+# Display Breakdown
+st.subheader("📑 Active Legs Breakdown")
+st.dataframe(metrics, use_container_width=True)
+
+# Rebalance Decision Alert
+if abs(net_delta) > (delta_threshold * lot_size):
+    action = "BUY" if hedge_needed > 0 else "SELL"
+    st.error(
+        f"🚨 **REBALANCE TRIGGERED:** Net Delta ({net_delta:.2f}) breached tolerance. "
+        f"Send **{action} {abs(hedge_needed)} Qty** Nifty Futures to re-neutralize."
+    )
+else:
+    st.success("✅ **DELTA NEUTRAL:** Portfolio remains safely within the designated delta band.")
+    
