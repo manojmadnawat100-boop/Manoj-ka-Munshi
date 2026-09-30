@@ -1,15 +1,13 @@
-
 import logging
 from datetime import datetime
-import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 
 logging.basicConfig(level=logging.INFO)
 
-st.set_page_config(page_title="Nifty Gamma Blast Radar", layout="wide")
-st.title("⚡ NIFTY 50 Institutional Gamma Blast & Short-Covering Engine")
+st.set_page_config(page_title="Nifty Gamma Blast Trader & Portfolio", layout="wide")
+st.title("⚡ NIFTY 50 Gamma Blast: Live Positions & 1-Click Multi-Lot Execution")
 
 TOKEN = st.secrets.get("UPSTOX_TOKEN", "")
 TG_TOKEN = st.secrets.get("TELEGRAM_TOKEN", "")
@@ -21,6 +19,7 @@ HEADERS = {
 }
 
 NIFTY_KEY = "NSE_INDEX|Nifty 50"
+NIFTY_LOT_SIZE = 75  # Nifty 1 lot size
 
 def send_tg(msg: str):
     if not TG_TOKEN or not TG_CHAT:
@@ -30,6 +29,51 @@ def send_tg(msg: str):
         requests.post(url, json={"chat_id": TG_CHAT, "text": msg, "parse_mode": "Markdown"}, timeout=5)
     except Exception as e:
         logging.error(f"Telegram fail: {e}")
+
+# --- ORDER PLACEMENT APIS ---
+def place_upstox_order(instrument_token: str, symbol_name: str, quantity: int, transaction_type: str = "BUY"):
+    """Places Intraday (MIS) Market Order"""
+    url = "https://api.upstox.com/v2/order/place"
+    payload = {
+        "quantity": quantity,
+        "product": "I",              # MIS (Intraday)
+        "validity": "DAY",
+        "price": 0,
+        "tag": "gamma_blast",
+        "instrument_token": instrument_token,
+        "order_type": "MARKET",
+        "transaction_type": transaction_type,
+        "disclosed_quantity": 0,
+        "trigger_price": 0,
+        "is_amo": False
+    }
+    
+    try:
+        res = requests.post(url, json=payload, headers=HEADERS, timeout=10)
+        res_data = res.json()
+        if res.status_code == 200 and res_data.get("status") == "success":
+            order_id = res_data.get("data", {}).get("order_id", "Success")
+            action_text = "BOUGHT" if transaction_type == "BUY" else "SQUARED OFF"
+            st.success(f"✅ {action_text}: {symbol_name} ({quantity} Qty) | Order ID: {order_id}")
+            send_tg(f"⚡ *ORDER ALERT*\nAction: *{action_text}*\nSymbol: *{symbol_name}*\nQty: {quantity}\nOrder ID: {order_id}")
+            st.rerun()
+        else:
+            err_msg = res_data.get("errors", [{}])[0].get("message", res.text)
+            st.error(f"❌ Order Failed: {err_msg}")
+    except Exception as e:
+        st.error(f"Order API error: {e}")
+
+def fetch_live_positions():
+    """Fetch live positions directly from Upstox account"""
+    url = "https://api.upstox.com/v2/portfolio/short-term-positions"
+    try:
+        res = requests.get(url, headers=HEADERS, timeout=8)
+        if res.status_code == 200:
+            return res.json().get("data", [])
+        return []
+    except Exception as e:
+        logging.error(f"Positions fetch error: {e}")
+        return []
 
 @st.cache_data(ttl=1800)
 def get_nifty_expiries():
@@ -41,8 +85,7 @@ def get_nifty_expiries():
             expiries = sorted(list(set([c["expiry"] for c in contracts if "expiry" in c])))
             return expiries
         return []
-    except Exception as e:
-        st.error(f"Expiry fetch error: {e}")
+    except Exception:
         return []
 
 def fetch_option_chain(expiry_date: str):
@@ -56,181 +99,224 @@ def fetch_option_chain(expiry_date: str):
     except Exception as e:
         return None, str(e)
 
-# --- UI Controls ---
-col1, col2, col3 = st.columns([2, 2, 1])
-with col1:
-    expiries = get_nifty_expiries()
-    if expiries:
-        selected_expiry = st.selectbox("Select Expiry Date", expiries, index=0)
+# ==========================================
+# 💼 1. LIVE OPEN POSITIONS BOX (DEDICATED)
+# ==========================================
+positions = fetch_live_positions()
+open_positions = [p for p in positions if int(p.get("quantity", 0)) != 0]
+
+st.subheader("💼 Active Trading Positions")
+
+with st.container():
+    if open_positions:
+        total_pnl = sum([float(p.get("pnl", 0.0)) for p in open_positions])
+        pnl_color = "green" if total_pnl >= 0 else "red"
+        st.markdown(f"**Total Live P&L:** <span style='font-size:20px; font-weight:bold; color:{pnl_color};'>₹{total_pnl:,.2f}</span>", unsafe_allow_html=True)
+
+        for pos in open_positions:
+            sym = pos.get("trading_symbol", "")
+            qty = int(pos.get("quantity", 0))
+            buy_avg = float(pos.get("buy_price", 0.0))
+            ltp = float(pos.get("last_price", 0.0))
+            pnl = float(pos.get("pnl", 0.0))
+            ikey = pos.get("instrument_token", "")
+            pos_color = "#28a745" if pnl >= 0 else "#dc3545"
+
+            with st.container():
+                p1, p2, p3, p4, p5 = st.columns([3, 2, 2, 2, 2])
+                with p1:
+                    st.markdown(f"### `{sym}`")
+                    st.caption(f"Qty: **{qty}** | Avg Buy: **₹{buy_avg:,.2f}**")
+                with p2:
+                    st.metric("Current LTP", f"₹{ltp:,.2f}")
+                with p3:
+                    st.markdown(f"**Live P&L**<br><span style='color:{pos_color}; font-size:18px; font-weight:bold;'>₹{pnl:,.2f}</span>", unsafe_allow_html=True)
+                with p4:
+                    ret_pct = ((ltp - buy_avg) / buy_avg * 100) if buy_avg > 0 else 0
+                    st.metric("Return %", f"{ret_pct:+.2f}%")
+                with p5:
+                    st.write("")
+                    # Emergency 1-Click Exit Button
+                    if st.button("🛑 Exit Position", key=f"exit_{sym}", type="primary", use_container_width=True):
+                        place_upstox_order(ikey, sym, abs(qty), transaction_type="SELL")
+                st.divider()
     else:
-        selected_expiry = None
-        st.warning("Expiry dates load nahi ho saki. Token check karein.")
+        st.info("ℹ️ Abhi koi active open position nahi hai. Entry lene par live P&L aur Exit button yahan aayega.")
 
-with col2:
-    range_strikes = st.slider("Near ATM Strikes View", min_value=5, max_value=20, value=10, step=1)
+st.markdown("---")
 
-with col3:
+# ==========================================
+# ⚡ 2. LOT SELECTION, EXPIRY & RADAR
+# ==========================================
+today_str = datetime.now().strftime("%Y-%m-%d")
+expiries = get_nifty_expiries()
+
+c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+with c1:
+    selected_expiry = st.selectbox("Select Expiry Date", expiries, index=0) if expiries else None
+with c2:
+    # 1 se 10 Lot chunane ka vikalp
+    lots = st.selectbox("Lots (1-10)", list(range(1, 11)), index=0)
+    total_qty = lots * NIFTY_LOT_SIZE
+    st.caption(f"Total Qty: **{total_qty}**")
+with c3:
+    range_strikes = st.slider("Strikes View", min_value=5, max_value=15, value=7, step=1)
+with c4:
     st.write("")
     st.write("")
-    scan_btn = st.button("🔄 Scan Gamma Traps", use_container_width=True)
+    refresh_btn = st.button("🔄 Refresh Radar", use_container_width=True)
 
-if (scan_btn or "nifty_chain_loaded" not in st.session_state) and selected_expiry:
-    st.session_state["nifty_chain_loaded"] = True
+is_today_expiry = (selected_expiry == today_str)
 
-    if not TOKEN:
-        st.error("⚠️ Streamlit Secrets mein `UPSTOX_TOKEN` enter karein.")
-    else:
-        with st.spinner("Option Chain aur Gamma traps calculate ho rahe hain..."):
-            chain_data, err = fetch_option_chain(selected_expiry)
+if not is_today_expiry and selected_expiry:
+    st.warning(f"⚠️ Aaj Expiry Day nahi hai (Selected Expiry: {selected_expiry} | Today: {today_str}). Gamma alerts Expiry day par trigger honge.")
 
-        if err:
-            st.error(err)
-        elif not chain_data:
-            st.warning("Option Chain data khali mila.")
+if selected_expiry and TOKEN:
+    with st.spinner("Option Chain aur liquidity metrics load ho rahe hain..."):
+        chain_data, err = fetch_option_chain(selected_expiry)
+
+    if not err and chain_data:
+        rows = []
+        underlying_spot = 0.0
+
+        for node in chain_data:
+            strike = float(node.get("strike_price", 0.0))
+            spot = node.get("underlying_spot_price", 0.0)
+            if spot > 0:
+                underlying_spot = spot
+
+            call = node.get("call_options", {})
+            put = node.get("put_options", {})
+
+            # Call Data
+            c_data = call.get("market_data", {})
+            c_ltp = float(c_data.get("ltp", 0.0))
+            c_oi = int(c_data.get("oi", 0))
+            c_prev_oi = int(c_data.get("prev_oi", 0))
+            c_vol = int(c_data.get("volume", 0))
+            c_oi_chg = c_oi - c_prev_oi
+            c_key = call.get("instrument_key", "")
+
+            # Put Data
+            p_data = put.get("market_data", {})
+            p_ltp = float(p_data.get("ltp", 0.0))
+            p_oi = int(p_data.get("oi", 0))
+            p_prev_oi = int(p_data.get("prev_oi", 0))
+            p_vol = int(p_data.get("volume", 0))
+            p_oi_chg = p_oi - p_prev_oi
+            p_key = put.get("instrument_key", "")
+
+            rows.append({
+                "Strike": strike,
+                "CE_Key": c_key,
+                "CE_OI": c_oi,
+                "CE_OI_Chg": c_oi_chg,
+                "CE_Vol": c_vol,
+                "CE_LTP": c_ltp,
+                "PE_Key": p_key,
+                "PE_LTP": p_ltp,
+                "PE_Vol": p_vol,
+                "PE_OI_Chg": p_oi_chg,
+                "PE_OI": p_oi
+            })
+
+        df = pd.DataFrame(rows).sort_values("Strike").reset_index(drop=True)
+
+        if underlying_spot > 0:
+            atm_idx = (df["Strike"] - underlying_spot).abs().idxmin()
+            start_idx = max(0, atm_idx - range_strikes)
+            end_idx = min(len(df), atm_idx + range_strikes + 1)
+            near_df = df.iloc[start_idx:end_idx].copy()
         else:
-            rows = []
-            underlying_spot = 0.0
+            near_df = df.copy()
 
-            total_ce_oi = 0
-            total_pe_oi = 0
+        # Gamma Traps Detection
+        blast_alerts = []
+        for _, r in near_df.iterrows():
+            strike = int(r["Strike"])
 
-            for node in chain_data:
-                strike = float(node.get("strike_price", 0.0))
-                spot = node.get("underlying_spot_price", 0.0)
-                if spot > 0:
-                    underlying_spot = spot
-
-                call = node.get("call_options", {})
-                put = node.get("put_options", {})
-
-                # Call metrics
-                c_data = call.get("market_data", {})
-                c_ltp = float(c_data.get("ltp", 0.0))
-                c_oi = int(c_data.get("oi", 0))
-                c_prev_oi = int(c_data.get("prev_oi", 0))
-                c_vol = int(c_data.get("volume", 0))
-                c_oi_chg = c_oi - c_prev_oi
-                c_gamma = float(call.get("option_greeks", {}).get("gamma", 0.0))
-
-                # Put metrics
-                p_data = put.get("market_data", {})
-                p_ltp = float(p_data.get("ltp", 0.0))
-                p_oi = int(p_data.get("oi", 0))
-                p_prev_oi = int(p_data.get("prev_oi", 0))
-                p_vol = int(p_data.get("volume", 0))
-                p_oi_chg = p_oi - p_prev_oi
-                p_gamma = float(put.get("option_greeks", {}).get("gamma", 0.0))
-
-                total_ce_oi += c_oi
-                total_pe_oi += p_oi
-
-                rows.append({
-                    "Strike": strike,
-                    "CE_OI": c_oi,
-                    "CE_OI_Chg": c_oi_chg,
-                    "CE_Vol": c_vol,
-                    "CE_LTP": c_ltp,
-                    "CE_Gamma": c_gamma,
-                    "PE_LTP": p_ltp,
-                    "PE_Vol": p_vol,
-                    "PE_OI_Chg": p_oi_chg,
-                    "PE_OI": p_oi,
-                    "PE_Gamma": p_gamma
+            # Call Unwinding Trap
+            ce_unwinding_pct = (abs(r["CE_OI_Chg"]) / (r["CE_OI"] + abs(r["CE_OI_Chg"]))) * 100 if (r["CE_OI"] + abs(r["CE_OI_Chg"])) > 0 else 0
+            if (r["CE_OI_Chg"] < -80000) and (ce_unwinding_pct >= 15) and (r["CE_Vol"] > r["CE_OI"] * 1.2) and (r["CE_LTP"] > 5):
+                blast_alerts.append({
+                    "Type": "🚀 CE GAMMA BLAST (BULLISH)",
+                    "Option": f"{strike} CE",
+                    "Key": r["CE_Key"],
+                    "LTP": r["CE_LTP"],
+                    "Unwound": f"{abs(r['CE_OI_Chg']):,}",
+                    "Volume": f"{r['CE_Vol']:,}"
                 })
 
-            df = pd.DataFrame(rows).sort_values("Strike").reset_index(drop=True)
+            # Put Unwinding Trap
+            pe_unwinding_pct = (abs(r["PE_OI_Chg"]) / (r["PE_OI"] + abs(r["PE_OI_Chg"]))) * 100 if (r["PE_OI"] + abs(r["PE_OI_Chg"])) > 0 else 0
+            if (r["PE_OI_Chg"] < -80000) and (pe_unwinding_pct >= 15) and (r["PE_Vol"] > r["PE_OI"] * 1.2) and (r["PE_LTP"] > 5):
+                blast_alerts.append({
+                    "Type": "🔥 PE GAMMA BLAST (BEARISH)",
+                    "Option": f"{strike} PE",
+                    "Key": r["PE_Key"],
+                    "LTP": r["PE_LTP"],
+                    "Unwound": f"{abs(r['PE_OI_Chg']):,}",
+                    "Volume": f"{r['PE_Vol']:,}"
+                })
 
-            # PCR Ratio
-            pcr = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi > 0 else 1.0
+        st.metric("NIFTY 50 Spot Price", f"₹{underlying_spot:,.2f}")
 
-            # Filter Near ATM Strikes
-            if underlying_spot > 0:
-                atm_idx = (df["Strike"] - underlying_spot).abs().idxmin()
-                start_idx = max(0, atm_idx - range_strikes)
-                end_idx = min(len(df), atm_idx + range_strikes + 1)
-                near_df = df.iloc[start_idx:end_idx].copy()
-            else:
-                near_df = df.copy()
+        # High Probability Blast Execution
+        if blast_alerts:
+            st.subheader(f"🎯 High-Probability Gamma Blast Opportunities ({len(blast_alerts)})")
+            for alert in blast_alerts:
+                b1, b2, b3, b4 = st.columns([3, 2, 2, 2])
+                with b1:
+                    st.markdown(f"**{alert['Type']}** — `{alert['Option']}`")
+                    st.caption(f"Unwound: {alert['Unwound']} | Vol: {alert['Volume']}")
+                with b2:
+                    st.markdown(f"**LTP:** ₹{alert['LTP']}")
+                with b3:
+                    st.markdown(f"**Order:** {lots} Lot ({total_qty} Qty)")
+                with b4:
+                    btn_text = f"🟢 BUY {alert['Option']}" if "CE" in alert['Option'] else f"🔴 BUY {alert['Option']}"
+                    if st.button(btn_text, key=f"blast_{alert['Option']}"):
+                        place_upstox_order(alert["Key"], alert["Option"], total_qty, "BUY")
+            st.divider()
 
-            # --- Gamma Blast Quantitative Engine ---
-            blast_alerts = []
-            for _, r in near_df.iterrows():
-                strike = int(r["Strike"])
+        # 1-Click Option Matrix
+        st.subheader(f"📋 Near ATM Strikes (Order Size: {lots} Lot / {total_qty} Qty)")
+        h1, h2, h3, h4, h5, h6, h7 = st.columns([2, 1, 1, 1, 1, 1, 2])
+        h1.markdown("**CE Order & Volume**")
+        h2.markdown("**CE OI Chg**")
+        h3.markdown("**CE LTP**")
+        h4.markdown("**Strike**")
+        h5.markdown("**PE LTP**")
+        h6.markdown("**PE OI Chg**")
+        h7.markdown("**PE Order & Volume**")
 
-                # 1. CE Short Covering Gamma Blast (Upside Spike)
-                # Shart: CE Writers exit kar rahe hain (-ve OI change), Volume > OI, aur Strike Spot ke kareeb hai
-                ce_unwinding_pct = (abs(r["CE_OI_Chg"]) / (r["CE_OI"] + abs(r["CE_OI_Chg"]))) * 100 if (r["CE_OI"] + abs(r["CE_OI_Chg"])) > 0 else 0
-                if (r["CE_OI_Chg"] < -100000) and (ce_unwinding_pct >= 15) and (r["CE_Vol"] > r["CE_OI"] * 1.2) and (r["CE_LTP"] > 10):
-                    intensity = "ULTRA HIGH" if r["CE_Vol"] > r["CE_OI"] * 2 else "HIGH"
-                    blast_alerts.append({
-                        "Type": "🚀 CE GAMMA BLAST (BULLISH SPIKE)",
-                        "Option": f"{strike} CE",
-                        "LTP": r["CE_LTP"],
-                        "Unwound Contracts": f"{abs(r['CE_OI_Chg']):,}",
-                        "Volume Surge": f"{r['CE_Vol']:,}",
-                        "Intensity": intensity,
-                        "Trigger Logic": "Call Writers Panic Exit + Aggressive Market Buys"
-                    })
+        for _, row in near_df.iterrows():
+            strike_val = int(row["Strike"])
+            m1, m2, m3, m4, m5, m6, m7 = st.columns([2, 1, 1, 1, 1, 1, 2])
 
-                # 2. PE Short Covering Gamma Blast (Downside Crash)
-                # Shart: PE Writers exit kar rahe hain (-ve OI change), Volume > OI
-                pe_unwinding_pct = (abs(r["PE_OI_Chg"]) / (r["PE_OI"] + abs(r["PE_OI_Chg"]))) * 100 if (r["PE_OI"] + abs(r["PE_OI_Chg"])) > 0 else 0
-                if (r["PE_OI_Chg"] < -100000) and (pe_unwinding_pct >= 15) and (r["PE_Vol"] > r["PE_OI"] * 1.2) and (r["PE_LTP"] > 10):
-                    intensity = "ULTRA HIGH" if r["PE_Vol"] > r["PE_OI"] * 2 else "HIGH"
-                    blast_alerts.append({
-                        "Type": "🔥 PE GAMMA BLAST (BEARISH CRASH)",
-                        "Option": f"{strike} PE",
-                        "LTP": r["PE_LTP"],
-                        "Unwound Contracts": f"{abs(r['PE_OI_Chg']):,}",
-                        "Volume Surge": f"{r['PE_Vol']:,}",
-                        "Intensity": intensity,
-                        "Trigger Logic": "Put Writers Trap + Heavy Panic Liquidation"
-                    })
-
-            # --- Dashboard KPIs ---
-            kpi1, kpi2, kpi3 = st.columns(3)
-            kpi1.metric("NIFTY 50 Spot", f"₹{underlying_spot:,.2f}")
-            kpi2.metric("Overall PCR", f"{pcr} ({'Bullish' if pcr > 1.2 else 'Bearish' if pcr < 0.8 else 'Neutral'})")
-            kpi3.metric("Selected Expiry", selected_expiry)
-
-            # Alerts Display
-            if blast_alerts:
-                st.subheader(f"🚨 Active Gamma Blast Setups ({len(blast_alerts)})")
-                adf = pd.DataFrame(blast_alerts)
-                st.dataframe(adf, use_container_width=True, hide_index=True)
-
-                for alert in blast_alerts:
-                    alert_key = f"tg_{selected_expiry}_{alert['Option']}_{datetime.now().strftime('%H%M')}"
-                    if alert_key not in st.session_state:
-                        msg = (
-                            f"⚡ *NIFTY GAMMA BLAST RADAR*\n"
-                            f"Expiry: *{selected_expiry}* | Spot: ₹{underlying_spot:,.1f}\n"
-                            f"Setup: *{alert['Type']}*\n"
-                            f"Contract: *{alert['Option']}* (LTP: ₹{alert['LTP']})\n"
-                            f"🔥 Intensity: *{alert['Intensity']}*\n"
-                            f"Panic Unwinding: {alert['Unwound Contracts']} contracts\n"
-                            f"Volume: {alert['Volume Surge']}\n"
-                            f"Note: {alert['Trigger Logic']}"
-                        )
-                        send_tg(msg)
-                        st.session_state[alert_key] = True
-            else:
-                st.info("ℹ️ Kisi bhi ATM strike par abhi aggressive panic unwinding trigger nahi hui hai.")
-
-            # Formatted Option Chain Matrix Table
-            st.subheader("📊 Near-the-Money Option Chain Matrix")
-            styled_df = near_df[[
-                "CE_OI", "CE_OI_Chg", "CE_Vol", "CE_LTP", "Strike", 
-                "PE_LTP", "PE_Vol", "PE_OI_Chg", "PE_OI"
-            ]].copy()
-
-            def highlight_unwinding(val):
-                if isinstance(val, (int, float)) and val < -50000:
-                    return 'background-color: #ffcccc; color: #900;'
-                return ''
-
-            st.dataframe(
-                styled_df.style.map(highlight_unwinding, subset=['CE_OI_Chg', 'PE_OI_Chg']),
-                use_container_width=True,
-                hide_index=True
-            )
+            with m1:
+                if st.button(f"🟢 Buy {strike_val} CE", key=f"mat_ce_{strike_val}"):
+                    place_upstox_order(row["CE_Key"], f"{strike_val} CE", total_qty, "BUY")
+                st.caption(f"Vol: {row['CE_Vol']:,}")
+            with m2:
+                ce_chg = row["CE_OI_Chg"]
+                color = "red" if ce_chg < 0 else "green"
+                st.markdown(f"<span style='color:{color}; font-weight:bold;'>{ce_chg:,}</span>", unsafe_allow_html=True)
+            with m3:
+                st.markdown(f"**₹{row['CE_LTP']}**")
+            with m4:
+                if abs(strike_val - underlying_spot) < 30:
+                    st.markdown(f"🎯 **{strike_val}**")
+                else:
+                    st.markdown(f"**{strike_val}**")
+            with m5:
+                st.markdown(f"**₹{row['PE_LTP']}**")
+            with m6:
+                pe_chg = row["PE_OI_Chg"]
+                color = "red" if pe_chg < 0 else "green"
+                st.markdown(f"<span style='color:{color}; font-weight:bold;'>{pe_chg:,}</span>", unsafe_allow_html=True)
+            with m7:
+                if st.button(f"🔴 Buy {strike_val} PE", key=f"mat_pe_{strike_val}"):
+                    place_upstox_order(row["PE_Key"], f"{strike_val} PE", total_qty, "BUY")
+                st.caption(f"Vol: {row['PE_Vol']:,}")
+                
