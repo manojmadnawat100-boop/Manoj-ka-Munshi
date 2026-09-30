@@ -25,7 +25,7 @@ HEADERS = {
     "Api-Version": "2.0"
 }
 QUOTE_URL = "https://api.upstox.com/v2/market-quote/quotes"
-HIST_URL = "https://api.upstox.com/v3/historical-candle"
+HIST_URL = "https://api.upstox.com/v2/historical-candle"
 
 # Official Weightage Hierarchy
 WEIGHTS = {
@@ -81,17 +81,25 @@ def get_instrument_keys():
 
 def fetch_candle_metrics(args):
     sym, ikey, today_str = args
+    default_res = {"rsi": 50.0, "ema9": 0.0, "ema21": 0.0, "above_vwap": True, "vwap": 0.0}
     try:
-        url = f"{HIST_URL}/{ikey}/minutes/5/{today_str}"
+        # Standard Upstox V2 endpoint: {HIST_URL}/{ikey}/30minute/{to_date}
+        url = f"{HIST_URL}/{ikey}/30minute/{today_str}"
         resp = requests.get(url, headers=HEADERS, timeout=6)
+        
+        # Fallback to daily candles if 30-minute is unavailable
         if resp.status_code != 200:
-            return sym, {"rsi": 50.0, "ema9": 0.0, "ema21": 0.0, "above_vwap": True, "vwap": 0.0}
+            url = f"{HIST_URL}/{ikey}/day/{today_str}"
+            resp = requests.get(url, headers=HEADERS, timeout=6)
+            
+        if resp.status_code != 200:
+            return sym, default_res
         
         candles = resp.json().get("data", {}).get("candles", [])
-        if len(candles) < 10:
-            return sym, {"rsi": 50.0, "ema9": 0.0, "ema21": 0.0, "above_vwap": True, "vwap": 0.0}
+        if not candles or len(candles) < 5:
+            return sym, default_res
         
-        # Upstox returns candles [timestamp, open, high, low, close, volume, open_interest]
+        # Upstox returns: [timestamp, open, high, low, close, volume, open_interest]
         candles = list(reversed(candles))
         df = pd.DataFrame(candles, columns=["ts", "o", "h", "l", "c", "v", "oi"])
         
@@ -104,9 +112,9 @@ def fetch_candle_metrics(args):
         ema9 = closes.ewm(span=9, adjust=False).mean().iloc[-1]
         ema21 = closes.ewm(span=21, adjust=False).mean().iloc[-1]
         
-        # Intraday True VWAP
         typical_price = (highs + lows + closes) / 3.0
-        vwap = (typical_price * vols).sum() / (vols.sum() + 1e-9)
+        total_vol = vols.sum()
+        vwap = (typical_price * vols).sum() / (total_vol + 1e-9) if total_vol > 0 else float(closes.iloc[-1])
         ltp = float(closes.iloc[-1])
         
         return sym, {
@@ -117,7 +125,7 @@ def fetch_candle_metrics(args):
             "vwap": round(vwap, 2)
         }
     except Exception:
-        return sym, {"rsi": 50.0, "ema9": 0.0, "ema21": 0.0, "above_vwap": True, "vwap": 0.0}
+        return sym, default_res
 
 def fetch_vix_index():
     try:
@@ -199,26 +207,60 @@ def render_dashboard():
         adv = metrics_map.get(sym, {"rsi": 50.0, "ema9": 0.0, "ema21": 0.0, "above_vwap": True, "vwap": ltp})
         weight = WEIGHTS.get(sym, 1.0)
         
-        # --- Strict Institutional Multi-Condition Logic ---
-        # 1. Directional Price Move
-        # 2. Above/Below Intraday Opening
-        # 3. Dynamic VWAP Support
-        # 4. Short-term Trend Alignment (EMA 9 vs 21)
-        # 5. Non-Exhausted RSI Corridor
-        bull_technicals = (pct_chg > 0.05) and (ltp >= open_price) and adv["above_vwap"] and (adv["ema9"] >= adv["ema21"]) and (adv["rsi"] < 70)
-        bear_technicals = (pct_chg < -0.05) and (ltp <= open_price) and (not adv["above_vwap"]) and (adv["ema9"] <= adv["ema21"]) and (adv["rsi"] > 30)
+        # --- Weighted Confluence Scoring (Robust against minor fluctuations) ---
+        bull_score = 0
+        bear_score = 0
 
-        # Depth Confluence
-        if buy_qty > 0 or sell_qty > 0:
-            bull = bull_technicals and (buy_qty > sell_qty)
-            bear = bear_technicals and (sell_qty > buy_qty)
+        # Price Direction
+        if pct_chg > 0.0:
+            bull_score += 1
+        elif pct_chg < 0.0:
+            bear_score += 1
+
+        # Day Open Support
+        if ltp >= open_price:
+            bull_score += 1
         else:
-            bull = bull_technicals
-            bear = bear_technicals
+            bear_score += 1
 
-        score = 1 if bull else (-1 if bear else 0)
+        # VWAP Alignment
+        if adv["vwap"] > 0:
+            if adv["above_vwap"]:
+                bull_score += 1
+            else:
+                bear_score += 1
+
+        # Trend (EMA 9 vs EMA 21)
+        if adv["ema9"] > 0 and adv["ema21"] > 0:
+            if adv["ema9"] >= adv["ema21"]:
+                bull_score += 1
+            else:
+                bear_score += 1
+
+        # RSI Momentum
+        if adv["rsi"] >= 50:
+            bull_score += 1
+        else:
+            bear_score += 1
+
+        # Order Book Confluence (if volume is present)
+        if buy_qty > sell_qty:
+            bull_score += 1
+        elif sell_qty > buy_qty:
+            bear_score += 1
+
+        # Decision: minimum 4 out of 6 positive criteria for directional bias
+        if bull_score >= 4:
+            score = 1
+            state = "🟢 Bull Confluence"
+        elif bear_score >= 4:
+            score = -1
+            state = "🔴 Bear Confluence"
+        else:
+            score = 0
+            state = "⚪ Choppy"
+
         scores[sym] = score
-        state = "🟢 Bull Confluence" if score == 1 else ("🔴 Bear Confluence" if score == -1 else "⚪ Choppy")
         
         rows.append({
             "Share": sym,
@@ -243,8 +285,8 @@ def render_dashboard():
     bullish_weight = df[df["Score"] == 1]["Weight (%)"].sum()
     bearish_weight = df[df["Score"] == -1]["Weight (%)"].sum()
     
-    bull_power = (bullish_weight / total_active_weight) * 100
-    bear_power = (bearish_weight / total_active_weight) * 100
+    bull_power = (bullish_weight / total_active_weight) * 100 if total_active_weight > 0 else 0.0
+    bear_power = (bearish_weight / total_active_weight) * 100 if total_active_weight > 0 else 0.0
     
     hdfc_bias = scores.get("HDFCBANK", 0)
     icici_bias = scores.get("ICICIBANK", 0)
@@ -268,9 +310,67 @@ def render_dashboard():
     elif vix_low_chop:
         current_signal = "BLOCKED"
         signal_reason = "VIX < 11.5: Option premiums eating theta, directional moves absent."
-    elif bull_power >= 62.0 and (hdfc_bias == 1 and icici_bias >= 0):
+    elif bull_power >= 60.0 and (hdfc_bias == 1 and icici_bias >= 0):
         current_signal = "BUY"
         signal_reason = f"Bull Power at {bull_power:.1f}% supported by HDFC Bank."
+    elif bear_power >= 60.0 and (hdfc_bias == -1 and icici_bias <= 0):
+        current_signal = "SELL"
+        signal_reason = f"Bear Power at {bear_power:.1f}% backed by Heavyweight selloff."
+    else:
+        current_signal = "HOLD"
+        signal_reason = "Consolidation Zone: Heavyweights divergent or power below 60% threshold."
+
+    # Visual Display
+    if current_signal == "BUY":
+        st.success(f"## 🟢 INSTITUTIONAL BUY ACTIVE\n*{signal_reason}*")
+    elif current_signal == "SELL":
+        st.error(f"## 🔴 INSTITUTIONAL SELL ACTIVE\n*{signal_reason}*")
+    elif current_signal == "BLOCKED":
+        st.warning(f"## ⛔ VOLATILITY SHIELD ENGAGED\n*{signal_reason}*")
+    else:
+        st.info(f"## 🟡 NO TRADE / ACCUMULATION ZONE\n*{signal_reason}*")
+
+    # ---------------- Telegram Dispatch with Cooldown ----------------
+    current_timestamp = time.time()
+    if current_signal in ["BUY", "SELL"]:
+        is_new_signal = (current_signal != st.session_state.last_signal)
+        cooldown_elapsed = (current_timestamp - st.session_state.last_alert_time) > 900
+        
+        if is_new_signal or cooldown_elapsed:
+            tg_text = (
+                f"🚨 *BANK NIFTY SIGNAL ALERT*\n\n"
+                f"*Action:* {'BUY CALL / FUT' if current_signal == 'BUY' else 'BUY PUT / SHORT FUT'}\n"
+                f"*Bull Power:* {bull_power:.1f}%\n"
+                f"*Bear Power:* {bear_power:.1f}%\n"
+                f"*India VIX:* {vix:.2f}\n"
+                f"*Heavyweights:* HDFC: {hdfc_bias}, ICICI: {icici_bias}\n"
+                f"*Time:* {ist_time} IST\n\n"
+                f"_{signal_reason}_"
+            )
+            send_telegram_alert(tg_text)
+            st.session_state.last_signal = current_signal
+            st.session_state.last_alert_time = current_timestamp
+            st.toast("⚡ Telegram Alert Broadcasted Successfully")
+    elif current_signal == "HOLD":
+        st.session_state.last_signal = "HOLD"
+
+    st.divider()
+
+    # ---------------- Heatmap Data Table ----------------
+    st.markdown("### 📋 Constituent Matrix Breakdown")
+    display_df = df.drop(columns=["Score", "Weighted_Score"]).sort_values("Weight (%)", ascending=False)
+    
+    st.dataframe(
+        display_df.style.apply(
+            lambda x: ['background: #e8f5e9' if v > 0 else ('background: #ffebee' if v < 0 else '') for v in x],
+            subset=['% Chg']
+        ),
+        use_container_width=True,
+        hide_index=True
+    )
+
+render_dashboard()
+DFC Bank."
     elif bear_power >= 62.0 and (hdfc_bias == -1 and icici_bias <= 0):
         current_signal = "SELL"
         signal_reason = f"Bear Power at {bear_power:.1f}% backed by Heavyweight selloff."
