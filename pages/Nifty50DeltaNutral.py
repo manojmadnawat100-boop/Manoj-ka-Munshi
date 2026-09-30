@@ -80,12 +80,14 @@ def log_order(symbol: str, side: str, qty: int, price: float, order_type: str = 
 
 
 # =====================================================================
-# 3. SIDEBAR CONTROLS & RISK LIMITS
+# 3. SIDEBAR CONTROLS & LOT SELECTION (1 to 10)
 # =====================================================================
 with st.sidebar:
-    st.header("⚙️ Risk & Order Multipliers")
+    st.header("⚙️ Risk & Order Settings")
     lot_size = st.number_input("Nifty Lot Size", min_value=25, max_value=150, value=75, step=25)
-    lot_multiplier = st.slider("Select Trade Lots (1 to 10)", min_value=1, max_value=10, value=1, step=1)
+    
+    # 1 se 10 tak lot chunane ka vikalp
+    lot_multiplier = st.slider("Select Strategy Lots (1 to 10)", min_value=1, max_value=10, value=1, step=1)
     
     delta_threshold = st.slider("Delta Rebalance Tolerance (Lots)", 0.1, 2.0, 0.5, 0.1)
     r_rate = st.number_input("Risk-Free Rate", min_value=0.01, max_value=0.15, value=0.065, step=0.005)
@@ -98,26 +100,26 @@ with st.sidebar:
         log_order("PORTFOLIO_ALL", "SQUARE_OFF", 0, 0.0, "MARKET_KILL")
         st.warning("All active positions squared off!")
 
-# Lot Quantities: 1 Lot Sell : 2 Lot Buy per multiplier
+# Ratio Calculation: 1 Lot Sell : 2 Lot Buy Hedge
 sell_qty = int(lot_multiplier * 1 * lot_size)
 buy_qty = int(lot_multiplier * 2 * lot_size)
 dte_y = max(days_to_expiry / 365.25, 1e-5)
 
 
 # =====================================================================
-# 4. AUTOMATIC STRIKE SELECTION ENGINE (PoP >= 80% ENFORCER)
+# 4. AUTO STRIKE SELECTOR (Minimum 80% PoP)
 # =====================================================================
-st.title("⚡ Auto 80%+ PoP Delta-Neutral Terminal")
+st.title("⚡ Nifty 80%+ PoP Algo Execution Terminal")
 
 future_price = st.number_input("Nifty Future LTP", min_value=15000.0, max_value=35000.0, value=24800.0, step=5.0)
 strike_step = 50
 atm_strike = int(round(future_price / strike_step) * strike_step)
 
-# Engine scans outwards to automatically lock the exact strike where PoP >= 80%
 selected_sell_ce = None
 selected_sell_pe = None
 selected_pop = 0.0
 
+# 80%+ PoP ke liye automatic scan
 for distance in range(100, 2000, strike_step):
     test_ce = atm_strike + distance
     test_pe = atm_strike - distance
@@ -128,18 +130,17 @@ for distance in range(100, 2000, strike_step):
         selected_pop = pop_score
         break
 
-# Fallback safety
 if selected_sell_ce is None:
     selected_sell_ce = atm_strike + 500
     selected_sell_pe = atm_strike - 500
     selected_pop = RobustBlack76.probability_of_profit(future_price, selected_sell_pe, selected_sell_ce, dte_y, est_iv)
 
-# Buy Hedge Strike auto-placed further OTM for margin relief (Ratio 1:2)
+# Buy Hedge Strike (Margin benefit ke liye 200 pts aur door)
 hedge_offset = 200
 buy_hedge_ce = selected_sell_ce + hedge_offset
 buy_hedge_pe = selected_sell_pe - hedge_offset
 
-# Theoretical Prices via Black-76
+# Prices via Black-76
 sell_ce_price = round(RobustBlack76.price(future_price, selected_sell_ce, dte_y, r_rate, est_iv, "CE"), 2)
 sell_pe_price = round(RobustBlack76.price(future_price, selected_sell_pe, dte_y, r_rate, est_iv, "PE"), 2)
 buy_ce_price = round(RobustBlack76.price(future_price, buy_hedge_ce, dte_y, r_rate, est_iv, "CE"), 2)
@@ -147,14 +148,13 @@ buy_pe_price = round(RobustBlack76.price(future_price, buy_hedge_pe, dte_y, r_ra
 
 
 # =====================================================================
-# 5. GREEKS & RISK DASHBOARD
+# 5. GREEKS & RISK METRICS
 # =====================================================================
 d_sell_ce = RobustBlack76.delta(future_price, selected_sell_ce, dte_y, r_rate, est_iv, "CE")
 d_sell_pe = RobustBlack76.delta(future_price, selected_sell_pe, dte_y, r_rate, est_iv, "PE")
 d_buy_ce = RobustBlack76.delta(future_price, buy_hedge_ce, dte_y, r_rate, est_iv, "CE")
 d_buy_pe = RobustBlack76.delta(future_price, buy_hedge_pe, dte_y, r_rate, est_iv, "PE")
 
-# 1 Sell (-sell_qty) aur 2 Buy (+buy_qty)
 options_net_delta = (
     (-sell_qty * d_sell_ce) +
     (-sell_qty * d_sell_pe) +
@@ -162,30 +162,29 @@ options_net_delta = (
     (buy_qty * d_buy_pe)
 )
 total_net_delta = options_net_delta + float(st.session_state.hedge_position)
-
 net_cash_flow = (sell_qty * (sell_ce_price + sell_pe_price)) - (buy_qty * (buy_ce_price + buy_pe_price))
 
 st.divider()
 k1, k2, k3, k4 = st.columns(4)
-k1.metric("Strategy PoP", f"{selected_pop:.1f} %", "Target ≥ 80% Matched")
-k2.metric("Safe Profit Zone", f"{selected_sell_pe} - {selected_sell_ce}", f"Spread: {selected_sell_ce - selected_sell_pe} pts")
+k1.metric("Strategy PoP", f"{selected_pop:.1f} %", "Min 80% Guaranteed")
+k2.metric("Safe Expiry Range", f"{selected_sell_pe} - {selected_sell_ce}", f"Spread: {selected_sell_ce - selected_sell_pe} pts")
 k3.metric("Net Delta Exposure", f"{total_net_delta:.2f}", f"Tolerance: ±{delta_threshold * lot_size:.1f}")
-k4.metric("Net Cashflow / Credit", f"₹{net_cash_flow:,.2f}", f"{lot_multiplier} Lots Multiplier")
+k4.metric("Net Cashflow / Credit", f"₹{net_cash_flow:,.2f}", f"{lot_multiplier} Lots Selected")
 
-# Auto-Configured Legs Display
-st.subheader("🎯 Auto-Selected 80%+ PoP Basket (1 Sell : 2 Buy)")
+# Position Summary
+st.subheader("🎯 Auto-Selected Legs (1 Lot Sell : 2 Lots Buy Hedge)")
 breakdown_records = [
-    {"Leg": f"{selected_sell_ce} CE (Auto Selected)", "Side": "SELL (1 Lot)", "Qty": sell_qty, "Est. LTP": sell_ce_price, "Delta": round(-sell_qty * d_sell_ce, 2)},
-    {"Leg": f"{selected_sell_pe} PE (Auto Selected)", "Side": "SELL (1 Lot)", "Qty": sell_qty, "Est. LTP": sell_pe_price, "Delta": round(-sell_qty * d_sell_pe, 2)},
-    {"Leg": f"{buy_hedge_ce} CE (Margin Hedge)", "Side": "BUY (2 Lots)", "Qty": buy_qty, "Est. LTP": buy_ce_price, "Delta": round(buy_qty * d_buy_ce, 2)},
-    {"Leg": f"{buy_hedge_pe} PE (Margin Hedge)", "Side": "BUY (2 Lots)", "Qty": buy_qty, "Est. LTP": buy_pe_price, "Delta": round(buy_qty * d_buy_pe, 2)},
-    {"Leg": "Futures Delta Hedge", "Side": "LONG" if st.session_state.hedge_position > 0 else "SHORT", "Qty": st.session_state.hedge_position, "Est. LTP": future_price, "Delta": round(st.session_state.hedge_position, 2)}
+    {"Leg": f"{buy_hedge_ce} CE (Margin Hedge)", "Action Sequence": "1. BUY PEHLE", "Qty": buy_qty, "Price": buy_ce_price, "Delta": round(buy_qty * d_buy_ce, 2)},
+    {"Leg": f"{buy_hedge_pe} PE (Margin Hedge)", "Action Sequence": "2. BUY PEHLE", "Qty": buy_qty, "Price": buy_pe_price, "Delta": round(buy_qty * d_buy_pe, 2)},
+    {"Leg": f"{selected_sell_ce} CE (Short)", "Action Sequence": "3. SELL BAAD ME", "Qty": sell_qty, "Price": sell_ce_price, "Delta": round(-sell_qty * d_sell_ce, 2)},
+    {"Leg": f"{selected_sell_pe} PE (Short)", "Action Sequence": "4. SELL BAAD ME", "Qty": sell_qty, "Price": sell_pe_price, "Delta": round(-sell_qty * d_sell_pe, 2)},
+    {"Leg": "Futures Delta Hedge", "Action Sequence": "DYNAMIC HEDGE", "Qty": st.session_state.hedge_position, "Price": future_price, "Delta": round(st.session_state.hedge_position, 2)}
 ]
 st.dataframe(pd.DataFrame(breakdown_records), use_container_width=True)
 
 
 # =====================================================================
-# 6. ONE-CLICK EXECUTION TERMINAL
+# 6. ORDER EXECUTION WITH STRICT ENTRY/EXIT SEQUENCING
 # =====================================================================
 st.subheader("🖥️ Execution Terminal")
 t_col1, t_col2 = st.columns([2, 1])
@@ -201,33 +200,42 @@ with t_col1:
             log_order("NIFTY_FUT", action, abs(rebal_qty), future_price, "IOC_LIMIT")
             st.rerun()
     else:
-        st.success("✅ **DELTA NEUTRAL:** Strategy delta safe zone me hai.")
+        st.success("✅ **DELTA NEUTRAL:** Portfolio balanced within safe limits.")
 
 with t_col2:
-    st.write("**One-Click Order Actions**")
+    st.write("**Sequential Orders Execution**")
     btn1, btn2 = st.columns(2)
+    
     with btn1:
         if st.button("🟢 Execute Strategy", use_container_width=True):
-            # Pehle buy hedge orders trigger honge margin benefit unlock karne ke liye
-            log_order(f"{buy_hedge_ce}CE", "BUY", buy_qty, buy_ce_price)
-            log_order(f"{buy_hedge_pe}PE", "BUY", buy_qty, buy_pe_price)
-            log_order(f"{selected_sell_ce}CE", "SELL", sell_qty, sell_ce_price)
-            log_order(f"{selected_sell_pe}PE", "SELL", sell_qty, sell_pe_price)
-            st.success("80%+ PoP Basket Orders Placed!")
+            # STEP 1: Pehle BUY hedge execute hoga (Margin benefit pane ke liye)
+            log_order(f"{buy_hedge_ce}CE", "BUY (ENTRY)", buy_qty, buy_ce_price)
+            log_order(f"{buy_hedge_pe}PE", "BUY (ENTRY)", buy_qty, buy_pe_price)
+            
+            # STEP 2: Baad me SELL order execute hoga (Kam margin me place ho jayega)
+            log_order(f"{selected_sell_ce}CE", "SELL (ENTRY)", sell_qty, sell_ce_price)
+            log_order(f"{selected_sell_pe}PE", "SELL (ENTRY)", sell_qty, sell_pe_price)
+            
+            st.success("Orders Placed: Pehle Buy fir Sell execution complete!")
             st.rerun()
+            
     with btn2:
         if st.button("🔴 Exit Strategy", use_container_width=True):
-            log_order(f"{selected_sell_ce}CE", "BUY (EXIT)", sell_qty, sell_ce_price)
-            log_order(f"{selected_sell_pe}PE", "BUY (EXIT)", sell_qty, sell_pe_price)
-            log_order(f"{buy_hedge_ce}CE", "SELL (EXIT)", buy_qty, buy_ce_price)
-            log_order(f"{buy_hedge_pe}PE", "SELL (EXIT)", buy_qty, buy_pe_price)
-            st.info("Basket Exited Successfully!")
+            # STEP 1: Pehle SELL leg ko BUY karke square off karenge (Naked risk khatam)
+            log_order(f"{selected_sell_ce}CE", "BUY (EXIT SHORT)", sell_qty, sell_ce_price)
+            log_order(f"{selected_sell_pe}PE", "BUY (EXIT SHORT)", sell_qty, sell_pe_price)
+            
+            # STEP 2: Baad me BUY hedge leg ko SELL karke close karenge
+            log_order(f"{buy_hedge_ce}CE", "SELL (EXIT HEDGE)", buy_qty, buy_ce_price)
+            log_order(f"{buy_hedge_pe}PE", "SELL (EXIT HEDGE)", buy_qty, buy_pe_price)
+            
+            st.info("Exit Placed: Pehle Sell exit hui fir Buy hedge close hua!")
             st.rerun()
 
 # Order Log Display
-st.subheader("📜 Order Logs")
+st.subheader("📜 Live Order Log Sequence")
 if st.session_state.order_book:
     st.dataframe(pd.DataFrame(st.session_state.order_book), use_container_width=True)
 else:
-    st.caption("Filhal koi active order nahi hai.")
-            
+    st.caption("Filhal koi active order placed nahi hua hai.")
+    
