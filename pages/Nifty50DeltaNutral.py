@@ -1,7 +1,8 @@
-from datetime import datetime, time
 import math
 import os
+import random
 import time as pytime
+from datetime import datetime, time
 from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
@@ -97,7 +98,7 @@ def log_leg_execution_to_storage(
 
 
 # =====================================================================
-# 1. QUANTITATIVE PRICING & GREEKS ENGINE (Black-76)
+# 1. QUANTITATIVE PRICING ENGINE (Black-76)
 # =====================================================================
 class RobustBlack76:
 
@@ -121,13 +122,14 @@ class RobustBlack76:
         option_type: str,
     ) -> float:
         if T <= 1e-5:
-            return max(0.0, (F - K) if option_type.upper() == "CE" else (K - F))
+            return max(0.05, (F - K) if option_type.upper() == "CE" else (K - F))
         d1, d2 = cls.calc_d1_d2(F, K, T, sigma)
         df = math.exp(-r * T)
         if option_type.upper() == "CE":
-            return max(0.05, df * (F * norm.cdf(d1) - K * norm.cdf(d2)))
+            val = df * (F * norm.cdf(d1) - K * norm.cdf(d2))
         else:
-            return max(0.05, df * (K * norm.cdf(-d2) - F * norm.cdf(-d1)))
+            val = df * (K * norm.cdf(-d2) - F * norm.cdf(-d1))
+        return max(0.05, round(val, 2))
 
     @classmethod
     def probability_of_profit(
@@ -158,17 +160,6 @@ class InstitutionalEngine:
         return round(put_oi / call_oi, 2)
 
     @staticmethod
-    def calculate_max_pain(strikes: list, call_oi: list, put_oi: list) -> float:
-        loss_matrix = []
-        for test_strike in strikes:
-            total_loss = 0.0
-            for k, c_oi, p_oi in zip(strikes, call_oi, put_oi):
-                total_loss += max(0.0, test_strike - k) * c_oi
-                total_loss += max(0.0, k - test_strike) * p_oi
-            loss_matrix.append(total_loss)
-        return strikes[int(np.argmin(loss_matrix))]
-
-    @staticmethod
     def vix_analysis(vix: float) -> dict:
         if vix < 11.5:
             return {
@@ -193,7 +184,27 @@ class InstitutionalEngine:
 
 
 # =====================================================================
-# 3. SESSION & OMS (Order Management System)
+# 3. UPSTOX LIVE MARKET DATA FETCHER
+# =====================================================================
+def get_upstox_ltp(instrument_key: str, access_token: str) -> float:
+    """Live Upstox account se real LTP nikalne ke liye."""
+    if not access_token:
+        return 0.0
+    try:
+        config = upstox_client.Configuration()
+        config.access_token = access_token
+        api_client = upstox_client.ApiClient(config)
+        market_quote_api = upstox_client.MarketQuoteApi(api_client)
+        resp = market_quote_api.get_market_quote_ohlc(instrument_key, "1d")
+        if resp and resp.data and instrument_key in resp.data:
+            return float(resp.data[instrument_key].last_price)
+    except Exception:
+        pass
+    return 0.0
+
+
+# =====================================================================
+# 4. SESSION & OMS (Order Management System)
 # =====================================================================
 if "order_book" not in st.session_state:
     st.session_state.order_book = []
@@ -209,6 +220,8 @@ if "daily_realized_loss" not in st.session_state:
     st.session_state.daily_realized_loss = 0.0
 if "last_realized_pnl" not in st.session_state:
     st.session_state.last_realized_pnl = 0.0
+if "simulated_ltp" not in st.session_state:
+    st.session_state.simulated_ltp = 24800.0
 
 
 def execute_upstox_order(
@@ -259,7 +272,7 @@ def execute_upstox_order(
             st.error(f"Order Rejected on {symbol}: {e}")
             return False, status, 0.0
     else:
-        # Paper Trading: Exact theoretical execution price (0 Slippage)
+        # Paper Trading: Zero slippage exact theoretical fill
         executed_price = round(theo_price, 2)
         status = "PAPER_FILLED"
         success = True
@@ -295,10 +308,10 @@ def execute_upstox_order(
 
 
 # =====================================================================
-# 4. SIDEBAR CONTROLS
+# 5. SIDEBAR CONFIGURATION
 # =====================================================================
 with st.sidebar:
-    st.header("⚡ Upstox Authentication")
+    st.header("⚡ Broker Integration")
     trading_mode = st.radio(
         "Trading Mode", ["Paper Trading (Safe)", "Live Upstox Account"]
     )
@@ -307,7 +320,7 @@ with st.sidebar:
         access_token = st.text_input("Upstox Access Token", type="password")
 
     st.divider()
-    st.header("🛡️ Capital Protection")
+    st.header("🛡️ Risk Limits")
     daily_account_loss_limit = st.number_input(
         "Daily Max Loss Circuit (₹)",
         min_value=1000,
@@ -319,11 +332,11 @@ with st.sidebar:
     if st.button("🔄 Reset Daily Realized PnL"):
         st.session_state.daily_realized_loss = 0.0
         st.session_state.last_realized_pnl = 0.0
-        st.success("Realized counters reset ho gaye!")
+        st.success("PnL counter reset!")
         st.rerun()
 
     st.divider()
-    st.header("🏛 FII / DII Parameters")
+    st.header("🏛 Market Data & Simulation")
     india_vix = st.number_input(
         "India VIX", min_value=8.0, max_value=45.0, value=13.6, step=0.1
     )
@@ -334,8 +347,6 @@ with st.sidebar:
         "Total Call OI", value=16200000, step=100000
     )
 
-    st.divider()
-    st.header("⚙️ Market Assumptions")
     lot_size = st.number_input("Nifty Lot Size", value=75, step=25)
     r_rate = st.number_input("Risk-Free Rate", value=0.065, step=0.005)
     days_to_expiry = st.slider(
@@ -345,15 +356,19 @@ with st.sidebar:
         value=2.0,
         step=0.05,
     )
-    auto_refresh_pnl = st.checkbox("Auto Refresh PnL (1 Sec)", value=False)
+
+    auto_market_ticks = st.checkbox(
+        "🟢 Enable Live Paper Market Ticks (Auto Simulation)", value=True
+    )
+    auto_refresh_pnl = st.checkbox("Auto-Refresh UI Every 1s", value=True)
 
     st.divider()
     if st.button(
-        "🚨 EMERGENCY KILL SWITCH", use_container_width=True, type="primary"
+        "🚨 EMERGENCY SQUARE-OFF ALL", use_container_width=True, type="primary"
     ):
         st.session_state.strategy_active = False
         st.session_state.peak_pnl = 0.0
-        st.warning("Sabhi positions squared off aur lock kar di gayi hain!")
+        st.warning("Sabhi positions squared off!")
         st.rerun()
 
 dte_y = max(days_to_expiry / 365.25, 1e-5)
@@ -361,9 +376,18 @@ est_iv = (india_vix + 1.0) / 100.0
 
 
 # =====================================================================
-# 5. MARKET SCAN & STRIKE SELECTION
+# 6. TICK ENGINE (REAL-TIME PRICE FLUCTUATION)
 # =====================================================================
-st.title("⚡ Institutional Nifty Terminal (Protected Execution)")
+# Agar Paper Trading hai aur live simulation enabled hai toh price randomly fluctuate karegi
+if auto_market_ticks and st.session_state.strategy_active:
+    tick_change = random.choice(
+        [-4.5, -2.5, -1.0, 0.0, 1.0, 2.5, 4.5]
+    )  # Natural Nifty moves
+    st.session_state.simulated_ltp = round(
+        st.session_state.simulated_ltp + tick_change, 2
+    )
+
+st.title("⚡ Institutional Nifty Terminal (Live Execution Engine)")
 
 if abs(st.session_state.daily_realized_loss) >= daily_account_loss_limit:
     st.error(
@@ -374,12 +398,15 @@ if abs(st.session_state.daily_realized_loss) >= daily_account_loss_limit:
 col_u1, col_u2 = st.columns(2)
 with col_u1:
     future_price = st.number_input(
-        "Nifty Future LTP (Simulate Price Changes here)",
+        "Nifty Future Reference LTP",
         min_value=15000.0,
         max_value=35000.0,
-        value=24800.0,
+        value=float(st.session_state.simulated_ltp),
         step=5.0,
     )
+    # Sync input back to state
+    st.session_state.simulated_ltp = future_price
+
 with col_u2:
     strategy_sets = st.selectbox(
         "Strategy Sets (1-10)", options=list(range(1, 11)), index=0
@@ -388,11 +415,10 @@ with col_u2:
 strike_step = 50
 atm_strike = int(round(future_price / strike_step) * strike_step)
 pcr_value = InstitutionalEngine.calculate_pcr(total_put_oi, total_call_oi)
-vix_info = InstitutionalEngine.vix_analysis(india_vix)
 
+# Strike Selection with Black-76 PoP Check
 selected_sell_ce = None
 selected_sell_pe = None
-selected_pop = 0.0
 
 for distance in range(100, 2000, strike_step):
     test_ce = atm_strike + distance
@@ -403,47 +429,35 @@ for distance in range(100, 2000, strike_step):
     if pop_score >= 80.0:
         selected_sell_ce = test_ce
         selected_sell_pe = test_pe
-        selected_pop = pop_score
         break
 
 if selected_sell_ce is None:
-    selected_sell_ce = atm_strike + 500
-    selected_sell_pe = atm_strike - 500
+    selected_sell_ce = atm_strike + 350
+    selected_sell_pe = atm_strike - 350
 
 hedge_offset = 200
 buy_hedge_ce = selected_sell_ce + hedge_offset
 buy_hedge_pe = selected_sell_pe - hedge_offset
 
-sell_ce_price = round(
-    RobustBlack76.price(
-        future_price, selected_sell_ce, dte_y, r_rate, est_iv, "CE"
-    ),
-    2,
+sell_ce_price = RobustBlack76.price(
+    future_price, selected_sell_ce, dte_y, r_rate, est_iv, "CE"
 )
-sell_pe_price = round(
-    RobustBlack76.price(
-        future_price, selected_sell_pe, dte_y, r_rate, est_iv, "PE"
-    ),
-    2,
+sell_pe_price = RobustBlack76.price(
+    future_price, selected_sell_pe, dte_y, r_rate, est_iv, "PE"
 )
-buy_ce_price = round(
-    RobustBlack76.price(
-        future_price, buy_hedge_ce, dte_y, r_rate, est_iv, "CE"
-    ),
-    2,
+buy_ce_price = RobustBlack76.price(
+    future_price, buy_hedge_ce, dte_y, r_rate, est_iv, "CE"
 )
-buy_pe_price = round(
-    RobustBlack76.price(
-        future_price, buy_hedge_pe, dte_y, r_rate, est_iv, "PE"
-    ),
-    2,
+buy_pe_price = RobustBlack76.price(
+    future_price, buy_hedge_pe, dte_y, r_rate, est_iv, "PE"
 )
 
 sell_qty = int(strategy_sets * 1 * lot_size)
 buy_qty = int(strategy_sets * 2 * lot_size)
 
+
 # =====================================================================
-# 6. LIVE PNL ENGINE & TRADE CONTROLS
+# 7. EXECUTION & LIVE PNL SECTION
 # =====================================================================
 st.divider()
 st.subheader("📊 Live Strategy PnL & Order Terminal")
@@ -457,9 +471,8 @@ with c_btn1:
             use_container_width=True,
             type="primary",
         ):
-            # Execute legs
             _, _, ep_sce = execute_upstox_order(
-                "NIFTY_SCE",
+                "NSE_INDEX|Nifty 50",
                 f"{selected_sell_ce} CE",
                 "SELL",
                 sell_qty,
@@ -471,7 +484,7 @@ with c_btn1:
                 "ENTRY",
             )
             _, _, ep_spe = execute_upstox_order(
-                "NIFTY_SPE",
+                "NSE_INDEX|Nifty 50",
                 f"{selected_sell_pe} PE",
                 "SELL",
                 sell_qty,
@@ -483,7 +496,7 @@ with c_btn1:
                 "ENTRY",
             )
             _, _, ep_bce = execute_upstox_order(
-                "NIFTY_BCE",
+                "NSE_INDEX|Nifty 50",
                 f"{buy_hedge_ce} CE",
                 "BUY",
                 buy_qty,
@@ -495,7 +508,7 @@ with c_btn1:
                 "ENTRY",
             )
             _, _, ep_bpe = execute_upstox_order(
-                "NIFTY_BPE",
+                "NSE_INDEX|Nifty 50",
                 f"{buy_hedge_pe} PE",
                 "BUY",
                 buy_qty,
@@ -522,7 +535,6 @@ with c_btn1:
             }
             st.session_state.strategy_active = True
             st.session_state.peak_pnl = 0.0
-            st.success("Strategy successfully deploy ho gayi!")
             st.rerun()
     else:
         st.info("🟢 Strategy live active hai. MTM updates neeche track ho rahe hain.")
@@ -534,51 +546,31 @@ with c_btn2:
             use_container_width=True,
             type="secondary",
         ):
-            # Exit valuation
-            curr_sce = RobustBlack76.price(
-                future_price,
-                st.session_state.active_strikes["sell_ce"],
-                dte_y,
-                r_rate,
-                est_iv,
-                "CE",
+            act_s = st.session_state.active_strikes
+            cur_sce = RobustBlack76.price(
+                future_price, act_s["sell_ce"], dte_y, r_rate, est_iv, "CE"
             )
-            curr_spe = RobustBlack76.price(
-                future_price,
-                st.session_state.active_strikes["sell_pe"],
-                dte_y,
-                r_rate,
-                est_iv,
-                "PE",
+            cur_spe = RobustBlack76.price(
+                future_price, act_s["sell_pe"], dte_y, r_rate, est_iv, "PE"
             )
-            curr_bce = RobustBlack76.price(
-                future_price,
-                st.session_state.active_strikes["buy_ce"],
-                dte_y,
-                r_rate,
-                est_iv,
-                "CE",
+            cur_bce = RobustBlack76.price(
+                future_price, act_s["buy_ce"], dte_y, r_rate, est_iv, "CE"
             )
-            curr_bpe = RobustBlack76.price(
-                future_price,
-                st.session_state.active_strikes["buy_pe"],
-                dte_y,
-                r_rate,
-                est_iv,
-                "PE",
+            cur_bpe = RobustBlack76.price(
+                future_price, act_s["buy_pe"], dte_y, r_rate, est_iv, "PE"
             )
 
-            act_sets = st.session_state.active_strikes["sets"]
+            act_sets = act_s["sets"]
             sq_sell_qty = int(act_sets * 1 * lot_size)
             sq_buy_qty = int(act_sets * 2 * lot_size)
 
             final_short_pnl = (
-                (st.session_state.entry_prices["sell_ce"] - curr_sce)
-                + (st.session_state.entry_prices["sell_pe"] - curr_spe)
+                (st.session_state.entry_prices["sell_ce"] - cur_sce)
+                + (st.session_state.entry_prices["sell_pe"] - cur_spe)
             ) * sq_sell_qty
             final_long_pnl = (
-                (curr_bce - st.session_state.entry_prices["buy_ce"])
-                + (curr_bpe - st.session_state.entry_prices["buy_pe"])
+                (cur_bce - st.session_state.entry_prices["buy_ce"])
+                + (cur_bpe - st.session_state.entry_prices["buy_pe"])
             ) * sq_buy_qty
             final_net_pnl = round(final_short_pnl + final_long_pnl, 2)
 
@@ -594,137 +586,32 @@ with c_btn2:
                 "MANUAL_EXIT",
                 act_sets,
                 final_net_pnl,
-                "User square-off",
+                "Manual exit",
                 f"Net: ₹{final_net_pnl}",
             )
-            st.warning(f"Position Square-Off! Realized PnL: ₹{final_net_pnl:,.2f}")
+            st.warning(f"Position Closed! Realized PnL: ₹{final_net_pnl:,.2f}")
             st.rerun()
 
-# ----------------- LIVE PNL DISPLAY SECTION -----------------
+# ----------------- DYNAMIC PNL ENGINE -----------------
 if st.session_state.strategy_active:
-    act_strikes = st.session_state.active_strikes
+    act_s = st.session_state.active_strikes
     entries = st.session_state.entry_prices
-    curr_sets = act_strikes["sets"]
+    curr_sets = act_s["sets"]
     cur_sell_qty = int(curr_sets * 1 * lot_size)
     cur_buy_qty = int(curr_sets * 2 * lot_size)
 
-    # Current LTP calculations on active strikes
-    cur_sce = round(
-        RobustBlack76.price(
-            future_price, act_strikes["sell_ce"], dte_y, r_rate, est_iv, "CE"
-        ),
-        2,
+    # Real LTP calculation based on dynamic underlying ticks
+    cur_sce = RobustBlack76.price(
+        future_price, act_s["sell_ce"], dte_y, r_rate, est_iv, "CE"
     )
-    cur_spe = round(
-        RobustBlack76.price(
-            future_price, act_strikes["sell_pe"], dte_y, r_rate, est_iv, "PE"
-        ),
-        2,
+    cur_spe = RobustBlack76.price(
+        future_price, act_s["sell_pe"], dte_y, r_rate, est_iv, "PE"
     )
-    cur_bce = round(
-        RobustBlack76.price(
-            future_price, act_strikes["buy_ce"], dte_y, r_rate, est_iv, "CE"
-        ),
-        2,
+    cur_bce = RobustBlack76.price(
+        future_price, act_s["buy_ce"], dte_y, r_rate, est_iv, "CE"
     )
-    cur_bpe = round(
-        RobustBlack76.price(
-            future_price, act_strikes["buy_pe"], dte_y, r_rate, est_iv, "PE"
-        ),
-        2,
+    cur_bpe = RobustBlack76.price(
+        future_price, act_s["buy_pe"], dte_y, r_rate, est_iv, "PE"
     )
 
-    # Leg-level PnL:
-    # Short leg profit = (Entry Price - Current Price) * Qty
-    # Long leg profit  = (Current Price - Entry Price) * Qty
-    pnl_sce = round((entries["sell_ce"] - cur_sce) * cur_sell_qty, 2)
-    pnl_spe = round((entries["sell_pe"] - cur_spe) * cur_sell_qty, 2)
-    pnl_bce = round((cur_bce - entries["buy_ce"]) * cur_buy_qty, 2)
-    pnl_bpe = round((cur_bpe - entries["buy_pe"]) * cur_buy_qty, 2)
-
-    total_mtm_pnl = round(pnl_sce + pnl_spe + pnl_bce + pnl_bpe, 2)
-    st.session_state.peak_pnl = max(st.session_state.peak_pnl, total_mtm_pnl)
-
-    # Metric Cards
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric(
-        "Current Strategy MTM PnL",
-        f"₹{total_mtm_pnl:,.2f}",
-        delta=f"₹{total_mtm_pnl:,.2f}",
-    )
-    m2.metric("Peak MTM Recorded", f"₹{st.session_state.peak_pnl:,.2f}")
-    m3.metric(
-        "Short Legs Decay PnL",
-        f"₹{(pnl_sce + pnl_spe):,.2f}",
-        help="Sell positions se aane wala decay",
-    )
-    m4.metric(
-        "Hedge Long PnL",
-        f"₹{(pnl_bce + pnl_bpe):,.2f}",
-        help="Protection hedges ka PnL",
-    )
-
-    # Granular Leg Performance Table
-    pnl_df = pd.DataFrame(
-        [
-            {
-                "Leg Name": f"{act_strikes['sell_ce']} CE (Short)",
-                "Side": "SELL",
-                "Qty": cur_sell_qty,
-                "Entry Price": f"₹{entries['sell_ce']}",
-                "Current Price": f"₹{cur_sce}",
-                "Leg PnL (₹)": pnl_sce,
-            },
-            {
-                "Leg Name": f"{act_strikes['sell_pe']} PE (Short)",
-                "Side": "SELL",
-                "Qty": cur_sell_qty,
-                "Entry Price": f"₹{entries['sell_pe']}",
-                "Current Price": f"₹{cur_spe}",
-                "Leg PnL (₹)": pnl_spe,
-            },
-            {
-                "Leg Name": f"{act_strikes['buy_ce']} CE (Hedge)",
-                "Side": "BUY",
-                "Qty": cur_buy_qty,
-                "Entry Price": f"₹{entries['buy_ce']}",
-                "Current Price": f"₹{cur_bce}",
-                "Leg PnL (₹)": pnl_bce,
-            },
-            {
-                "Leg Name": f"{act_strikes['buy_pe']} PE (Hedge)",
-                "Side": "BUY",
-                "Qty": cur_buy_qty,
-                "Entry Price": f"₹{entries['buy_pe']}",
-                "Current Price": f"₹{cur_bpe}",
-                "Leg PnL (₹)": pnl_bpe,
-            },
-        ]
-    )
-    st.table(pnl_df)
-
-    if auto_refresh_pnl:
-        pytime.sleep(1)
-        st.rerun()
-else:
-    col_r1, col_r2 = st.columns(2)
-    col_r1.metric(
-        "Last Closed Trade PnL", f"₹{st.session_state.last_realized_pnl:,.2f}"
-    )
-    col_r2.metric(
-        "Total Realized Session PnL",
-        f"₹{st.session_state.daily_realized_loss:,.2f}",
-    )
-    st.info(
-        "💡 Strategy filhaal Inactive hai. Upar **'Deploy Strategy'** button click karke paper trade start karein."
-    )
-
-# =====================================================================
-# 7. ORDER BOOK LOG VIEWER
-# =====================================================================
-st.divider()
-st.subheader("📜 Terminal Order Book (Executed Transactions)")
-if st.session_state.order_book:
-    st.dataframe(pd.DataFrame(st.session_state.order_book), height=220)
-else:
-    st.write("Abhi tak koi order execute nahi hua hai.")
+   
